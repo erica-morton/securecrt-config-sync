@@ -130,6 +130,59 @@ config_path="$(cd "$config_path" && pwd -P)"
 mkdir -p "$personal_path"
 personal_path="$(cd "$personal_path" && pwd -P)"
 
+sync_session_usernames() {
+  shared_sessions="$1"
+  personal_sessions="$2"
+  synced=0
+
+  while IFS= read -r -d '' session_file; do
+    username="$(LC_ALL=C awk '
+      /^S:"Username"=/ {
+        sub(/\r$/, "")
+        sub(/^S:"Username"=/, "")
+        print
+        exit
+      }
+    ' "$session_file")"
+    if [ -z "$username" ]; then
+      continue
+    fi
+
+    relative_path="${session_file#"$shared_sessions"/}"
+    personal_file="$personal_sessions/$relative_path"
+    mkdir -p "$(dirname "$personal_file")"
+
+    if [ -f "$personal_file" ]; then
+      temp_file="$(mktemp "${personal_file}.tmp.XXXXXX")"
+      LC_ALL=C awk -v username="$username" '
+        BEGIN { replacement = "S:\"Username\"=" username }
+        {
+          sub(/\r$/, "")
+          if ($0 ~ /^S:"Username"=/) {
+            if (!found) print replacement
+            found = 1
+            next
+          }
+          print
+        }
+        END { if (!found) print replacement }
+      ' ORS='\r\n' "$personal_file" >"$temp_file"
+      mv "$temp_file" "$personal_file"
+    else
+      (
+        umask 077
+        printf '\357\273\277D:"Session Password Saved"=00000000\r\nS:"Username"=%s\r\n' \
+          "$username" >"$personal_file"
+      )
+    fi
+    synced=$((synced + 1))
+  done < <(find "$shared_sessions" -type f -name '*.ini' ! -name '__FolderData__.ini' ! -name 'Default.ini' -print0)
+
+  printf '%s' "$synced"
+}
+
+synced_username_count="$(sync_session_usernames "$config_path/Sessions" "$personal_path/Sessions")"
+
 old_config="$(defaults read "$preferences_domain" "Config Path" 2>/dev/null || true)"
 old_personal="$(defaults read "$preferences_domain" "Personal Data Path" 2>/dev/null || true)"
 if [ "$old_config" != "$config_path" ] || [ "$old_personal" != "$personal_path" ]; then
@@ -171,6 +224,7 @@ SecureCRT OneDrive setup is complete.
   Shared configuration: $config_path
   Local personal data:  $personal_path
   Saved sessions:        $session_count
+  Synced usernames:      $synced_username_count
 
 The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd

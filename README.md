@@ -1,8 +1,9 @@
 # SecureCRT Config Sync
 
 Cross-platform bootstrap helpers for using a shared SecureCRT configuration
-from OneDrive while keeping usernames, passwords, passphrases, automated logon
-data, and private keys local to each computer.
+from OneDrive while keeping passwords, passphrases, automated logon data, and
+private keys local to each computer. Session usernames may be shared as
+ordinary connection metadata.
 
 The project configures SecureCRT; it does not install SecureCRT or OneDrive.
 It is not affiliated with or endorsed by VanDyke Software, Inc.
@@ -14,6 +15,7 @@ It is not affiliated with or endorsed by VanDyke Software, Inc.
 - refuses configurations whose session files appear to contain saved
   passwords or passphrases;
 - creates a machine-local Personal Data folder;
+- initializes its session usernames from the shared connection metadata;
 - configures SecureCRT's shared and personal paths on macOS or Windows;
 - pins the SecureCRT tree for offline use on Windows;
 - backs up previous path settings before changing them;
@@ -89,13 +91,20 @@ For an explicit shared configuration path, run PowerShell:
 
 ## Daily use
 
-Do not run SecureCRT against the shared configuration on multiple computers at
-the same time. Close it on one machine and allow OneDrive to finish syncing
-before opening it on another.
+With enough SecureCRT licenses for simultaneous use, clients may remain open on
+multiple computers for normal terminal work. Avoid changing the same shared
+session or preference on two computers at once, and allow OneDrive to finish
+syncing after configuration changes before editing them elsewhere. VanDyke's
+[licensing FAQ](https://www.vandyke.com/products/securecrt/faq/index.html)
+allows a single-user license to be installed on multiple computers only when
+the software is used on one computer at a time; simultaneous use requires
+another license.
 
-The shared `Config` tree can contain sessions, global preferences, default
-session settings, color schemes, button bars, and host-key data. Personal Data
-and private key material stay local.
+The shared `Config` tree can contain sessions and their usernames, global
+preferences, default session settings, color schemes, button bars, and host-key
+data. During setup, the helpers also merge those usernames into the local
+Personal Data tree without replacing existing credential fields. Credentials,
+Personal Data, and private key material stay local.
 
 ## Tests and limits
 

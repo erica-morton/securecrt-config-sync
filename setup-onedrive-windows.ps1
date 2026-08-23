@@ -54,6 +54,84 @@ function Get-NormalizedDirectory {
     return (Get-Item -LiteralPath $Path).FullName.TrimEnd([char[]]'\/')
 }
 
+function Set-PersonalSessionUsername {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Username
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $usernameLine = 'S:"Username"=' + $Username
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $content = [IO.File]::ReadAllText($Path)
+        $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $hasTrailingNewline = $content.EndsWith("`n")
+        $lines = [Regex]::Split($content, '\r?\n')
+        if ($hasTrailingNewline -and $lines.Count -gt 0 -and $lines[-1] -eq '') {
+            $lines = $lines[0..($lines.Count - 2)]
+        }
+
+        $updatedLines = [System.Collections.Generic.List[string]]::new()
+        $found = $false
+        foreach ($line in $lines) {
+            if ($line -match '^S:"Username"=') {
+                if (-not $found) {
+                    $updatedLines.Add($usernameLine)
+                    $found = $true
+                }
+                continue
+            }
+            $updatedLines.Add($line)
+        }
+        if (-not $found) {
+            $updatedLines.Add($usernameLine)
+        }
+        $content = $updatedLines -join $newline
+        if ($hasTrailingNewline) {
+            $content += $newline
+        }
+    } else {
+        $content = "D:`"Session Password Saved`"=00000000`r`n$usernameLine`r`n"
+    }
+
+    [IO.File]::WriteAllText($Path, $content, [Text.UTF8Encoding]::new($true))
+}
+
+function Sync-SessionUsernames {
+    param(
+        [Parameter(Mandatory)][IO.FileInfo[]]$SessionFiles,
+        [Parameter(Mandatory)][string]$SharedSessionsPath,
+        [Parameter(Mandatory)][string]$PersonalDataPath
+    )
+
+    $synced = 0
+    $personalSessionsPath = Join-Path $PersonalDataPath 'Sessions'
+    foreach ($sessionFile in $SessionFiles) {
+        if ($sessionFile.Name -in '__FolderData__.ini', 'Default.ini') {
+            continue
+        }
+
+        $username = $null
+        foreach ($line in [IO.File]::ReadAllLines($sessionFile.FullName)) {
+            if ($line -match '^S:"Username"=(.*)$') {
+                $username = $Matches[1]
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($username)) {
+            continue
+        }
+
+        $relativePath = $sessionFile.FullName.Substring($SharedSessionsPath.Length).TrimStart([char[]]'\/')
+        $personalSession = Join-Path $personalSessionsPath $relativePath
+        Set-PersonalSessionUsername -Path $personalSession -Username $username
+        $synced++
+    }
+    return $synced
+}
+
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $candidates = [System.Collections.Generic.List[string]]::new()
 
@@ -146,6 +224,10 @@ if ([string]::IsNullOrWhiteSpace($PersonalDataPath)) {
 }
 New-Item -ItemType Directory -Path $PersonalDataPath -Force | Out-Null
 $PersonalDataPath = Get-NormalizedDirectory -Path $PersonalDataPath
+$syncedUsernameCount = Sync-SessionUsernames `
+    -SessionFiles $sessionFiles `
+    -SharedSessionsPath $sessionsPath `
+    -PersonalDataPath $PersonalDataPath
 
 $oldConfigPath = $null
 $oldPersonalDataPath = $null
@@ -197,5 +279,6 @@ Write-Host 'SecureCRT OneDrive setup is complete.'
 Write-Host "  Shared configuration: $ConfigPath"
 Write-Host "  Local personal data:  $PersonalDataPath"
 Write-Host "  Saved sessions:        $sessionCount"
+Write-Host "  Synced usernames:      $syncedUsernameCount"
 Write-Host ''
 Write-Host 'Launch SecureCRT normally. No administrator access or Git checkout is required.'

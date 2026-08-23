@@ -29,8 +29,11 @@ session_group="$config_path/Sessions/Example Group"
 mkdir -p "$session_group/VMs" "$test_root/home"
 printf 'test global configuration\n' >"$config_path/Global.ini"
 printf 'folder metadata\n' >"$session_group/__FolderData__.ini"
-printf 'host one\n' >"$session_group/host-one.ini"
-printf 'host two\n' >"$session_group/VMs/host-two.ini"
+printf 'S:"Hostname"=host-one.example\r\nS:"Username"=erica\r\n' >"$session_group/host-one.ini"
+printf 'S:"Hostname"=host-two.example\r\nS:"Username"=root\r\n' >"$session_group/VMs/host-two.ini"
+mkdir -p "$personal_path/Sessions/Example Group"
+printf '\357\273\277S:"Password V2"=preserve-me\r\nS:"Username"=wrong-user\r\n' \
+  >"$personal_path/Sessions/Example Group/host-one.ini"
 
 defaults write "$preferences_domain" "Config Path" -string "/previous/config"
 defaults write "$preferences_domain" "Personal Data Path" -string "/previous/personal"
@@ -48,6 +51,10 @@ assert_equal "$normalized_config" "$(defaults read "$preferences_domain" "Config
 assert_equal "$normalized_personal" "$(defaults read "$preferences_domain" "Personal Data Path")" "Personal Data Path"
 
 printf '%s\n' "$first_output" | grep -Eq 'Saved sessions: +2'
+printf '%s\n' "$first_output" | grep -Eq 'Synced usernames: +2'
+grep -Fq 'S:"Username"=erica' "$personal_path/Sessions/Example Group/host-one.ini"
+grep -Fq 'S:"Password V2"=preserve-me' "$personal_path/Sessions/Example Group/host-one.ini"
+grep -Fq 'S:"Username"=root' "$personal_path/Sessions/Example Group/VMs/host-two.ini"
 cmp "$template_dir/setup-onedrive-macos.sh" "$test_root/OneDrive/SecureCRT/setup-onedrive-macos.sh"
 cmp "$template_dir/setup-onedrive-windows.ps1" "$test_root/OneDrive/SecureCRT/setup-onedrive-windows.ps1"
 cmp "$template_dir/setup-onedrive-windows.cmd" "$test_root/OneDrive/SecureCRT/setup-onedrive-windows.cmd"

@@ -37,8 +37,10 @@ function New-TestConfiguration {
     New-Item -ItemType Directory -Path (Join-Path $sessionGroup 'VMs') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $config 'Global.ini') -Value 'test global configuration'
     Set-Content -LiteralPath (Join-Path $sessionGroup '__FolderData__.ini') -Value 'folder metadata'
-    Set-Content -LiteralPath (Join-Path $sessionGroup 'host-one.ini') -Value 'host one'
-    Set-Content -LiteralPath (Join-Path $sessionGroup 'VMs\host-two.ini') -Value 'host two'
+    Set-Content -LiteralPath (Join-Path $sessionGroup 'host-one.ini') `
+        -Value @('S:"Hostname"=host-one.example', 'S:"Username"=erica')
+    Set-Content -LiteralPath (Join-Path $sessionGroup 'VMs\host-two.ini') `
+        -Value @('S:"Hostname"=host-two.example', 'S:"Username"=root')
     return $config
 }
 
@@ -49,6 +51,10 @@ try {
 
     $configPath = New-TestConfiguration -Root (Join-Path $testRoot 'OneDrive')
     $personalPath = Join-Path $testRoot 'Personal\Config.personal'
+    $existingPersonalSession = Join-Path $personalPath 'Sessions\Example Group\host-one.ini'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $existingPersonalSession) -Force | Out-Null
+    Set-Content -LiteralPath $existingPersonalSession `
+        -Value @('S:"Password V2"=preserve-me', 'S:"Username"=wrong-user')
 
     New-Item -Path $registryPath -Force | Out-Null
     New-ItemProperty -LiteralPath $registryPath -Name 'Config Path' `
@@ -73,6 +79,18 @@ try {
     }
     if ($firstOutput -notmatch 'Saved sessions:\s+2') {
         throw "The installer reported the wrong session count:`n$firstOutput"
+    }
+    if ($firstOutput -notmatch 'Synced usernames:\s+2') {
+        throw "The installer reported the wrong username count:`n$firstOutput"
+    }
+    $hostOnePersonal = Get-Content -LiteralPath $existingPersonalSession -Raw
+    if ($hostOnePersonal -notmatch 'S:"Username"=erica' -or
+        $hostOnePersonal -notmatch 'S:"Password V2"=preserve-me') {
+        throw 'The existing Personal Data session was not merged safely.'
+    }
+    $hostTwoPersonalPath = Join-Path $personalPath 'Sessions\Example Group\VMs\host-two.ini'
+    if ((Get-Content -LiteralPath $hostTwoPersonalPath -Raw) -notmatch 'S:"Username"=root') {
+        throw 'The missing Personal Data session was not initialized.'
     }
 
     $backupDirectory = Join-Path $env:LOCALAPPDATA 'VanDyke\SecureCRT-Setup-Backups'
