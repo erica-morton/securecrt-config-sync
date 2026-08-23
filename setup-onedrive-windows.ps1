@@ -15,6 +15,123 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$AgentPipe = '\\.\pipe\openssh-ssh-agent'
+$testMode = $env:SECURECRT_CONFIG_SYNC_TEST_MODE -eq '1'
+$AgentEnvironmentTarget = if ($testMode) { 'Process' } else { 'User' }
+$RequiredHelpers = @(
+    'setup-onedrive-macos.sh',
+    'setup-onedrive-windows.ps1',
+    'setup-onedrive-windows.cmd'
+)
+foreach ($helper in $RequiredHelpers) {
+    $helperPath = Join-Path $PSScriptRoot $helper
+    if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+        throw @"
+Required setup helper is missing: $helperPath
+Keep all three setup-onedrive-* files together, then retry.
+"@
+    }
+}
+
+function Get-OnePasswordSshAgentIssue {
+    $issues = [System.Collections.Generic.List[string]]::new()
+    if ($testMode) {
+        if ($env:SECURECRT_CONFIG_SYNC_TEST_AGENT_STATE -eq 'missing') {
+            $issues.Add('1Password is not running.')
+            $issues.Add("The SSH agent pipe is not available: $AgentPipe")
+        }
+        return $issues
+    }
+
+    $onePassword = @(Get-Process -Name '1Password' -ErrorAction SilentlyContinue)
+    if ($onePassword.Count -eq 0) {
+        $issues.Add('1Password is not running.')
+    }
+
+    $windowsAgent = Get-Service -Name 'ssh-agent' -ErrorAction SilentlyContinue
+    if ($null -ne $windowsAgent -and $windowsAgent.Status -eq 'Running') {
+        $issues.Add('The Windows OpenSSH Authentication Agent service is running.')
+    }
+
+    $pipeExists = $false
+    try {
+        $pipeExists = @([IO.Directory]::GetFiles('\\.\pipe\')) -contains $AgentPipe
+    } catch {
+        $pipeExists = Test-Path -LiteralPath $AgentPipe
+    }
+    if (-not $pipeExists) {
+        $issues.Add("The SSH agent pipe is not available: $AgentPipe")
+    }
+    return $issues
+}
+
+function Wait-OnePasswordSshAgent {
+    while ($true) {
+        $issues = @(Get-OnePasswordSshAgentIssue)
+        if ($issues.Count -eq 0) {
+            Write-Host '1Password SSH agent is ready. Continuing setup.'
+            return
+        }
+
+        Write-Host ''
+        Write-Host '1Password SSH agent setup is required before SecureCRT can be configured.'
+        foreach ($issue in $issues) {
+            Write-Host "  - $issue"
+        }
+        Write-Host ''
+        Write-Host '1. Install or open 1Password and unlock it.'
+        Write-Host '2. Open Settings > Developer and enable "Use the SSH Agent".'
+        Write-Host '3. If the Windows OpenSSH Authentication Agent service is running,'
+        Write-Host '   stop it and set its startup type to Disabled.'
+
+        $inputIsRedirected = [Console]::IsInputRedirected -or
+            ($testMode -and $env:SECURECRT_CONFIG_SYNC_TEST_NONINTERACTIVE -eq '1')
+        if ($inputIsRedirected) {
+            throw 'Setup is non-interactive, so it cannot wait for 1Password. Run it from a console.'
+        }
+        $null = Read-Host 'Press Enter after completing those steps to test again (or Ctrl+C to cancel)'
+    }
+}
+
+Wait-OnePasswordSshAgent
+
+function Send-EnvironmentChangedNotification {
+    if ($testMode) {
+        return
+    }
+
+    if ($null -eq ('SecureCrtConfigSync.NativeMethods' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace SecureCrtConfigSync {
+    public static class NativeMethods {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd,
+            uint message,
+            UIntPtr wParam,
+            string lParam,
+            uint flags,
+            uint timeout,
+            out UIntPtr result);
+    }
+}
+'@
+    }
+
+    $result = [UIntPtr]::Zero
+    $null = [SecureCrtConfigSync.NativeMethods]::SendMessageTimeout(
+        [IntPtr]0xffff,
+        0x001a,
+        [UIntPtr]::Zero,
+        'Environment',
+        0x0002,
+        5000,
+        [ref]$result
+    )
+}
 
 function Stop-VanDykeClientsGracefully {
     $runningClients = @(Get-Process -Name SecureCRT, SecureFX -ErrorAction SilentlyContinue)
@@ -52,6 +169,109 @@ function Get-NormalizedDirectory {
         throw "Folder not found: $Path"
     }
     return (Get-Item -LiteralPath $Path).FullName.TrimEnd([char[]]'\/')
+}
+
+function Test-CompleteConfiguration {
+    param([Parameter(Mandatory)][string]$Path)
+
+    return (
+        (Test-Path -LiteralPath (Join-Path $Path 'Global.ini') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $Path 'Sessions') -PathType Container)
+    )
+}
+
+function Get-OptionalRegistryValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $item = Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) {
+        return $null
+    }
+    $property = $item.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Assert-ShareableConfiguration {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-CompleteConfiguration -Path $Path)) {
+        throw "The configuration is incomplete: $Path"
+    }
+
+    $candidateSessionFiles = @(
+        Get-ChildItem -LiteralPath (Join-Path $Path 'Sessions') -File -Filter '*.ini' -Recurse
+    )
+    $sensitiveFiles = @(
+        $candidateSessionFiles |
+            Select-String -Pattern @(
+                'S:"[^"]*(?:Password|Passphrase)[^"]*"=.+$',
+                'D:"Session Password Saved"=00000001$'
+            ) |
+            ForEach-Object Path |
+            Sort-Object -Unique
+    )
+    if ($sensitiveFiles.Count -gt 0) {
+        $fileList = $sensitiveFiles -join "`n  "
+        throw @"
+Refusing to share a configuration that may contain saved credentials.
+Move credentials into SecureCRT's Personal Data folder, then retry. Files:
+  $fileList
+"@
+    }
+}
+
+function Copy-ConfigurationAtomically {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    Assert-ShareableConfiguration -Path $Source
+    $destinationParent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+    $stagingPath = Join-Path $destinationParent ".Config.migration.$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $stagingPath | Out-Null
+    try {
+        Get-ChildItem -LiteralPath $Source -Force |
+            Copy-Item -Destination $stagingPath -Recurse -Force
+        Assert-ShareableConfiguration -Path $stagingPath
+        Move-Item -LiteralPath $stagingPath -Destination $Destination
+    } catch {
+        Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    Write-Host 'Migrated the existing SecureCRT configuration:'
+    Write-Host "  From: $Source"
+    Write-Host "  To:   $Destination"
+}
+
+function Publish-SetupPackage {
+    param([Parameter(Mandatory)][string]$SharedConfigurationPath)
+
+    $secureCrtRoot = Split-Path -Parent $SharedConfigurationPath
+    foreach ($helper in $RequiredHelpers) {
+        $sourcePath = (Get-Item -LiteralPath (Join-Path $PSScriptRoot $helper)).FullName
+        $targetPath = Join-Path $secureCrtRoot $helper
+        $samePath = $sourcePath.Equals(
+            [IO.Path]::GetFullPath($targetPath),
+            [StringComparison]::OrdinalIgnoreCase
+        )
+        if (-not $samePath) {
+            Copy-Item -LiteralPath $sourcePath -Destination $targetPath -Force
+        }
+        if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash) {
+            throw "Setup helper publication failed: $targetPath"
+        }
+    }
 }
 
 function Set-PersonalSessionUsername {
@@ -99,7 +319,7 @@ function Set-PersonalSessionUsername {
     [IO.File]::WriteAllText($Path, $content, [Text.UTF8Encoding]::new($true))
 }
 
-function Sync-SessionUsernames {
+function Sync-SessionUsername {
     param(
         [Parameter(Mandatory)][IO.FileInfo[]]$SessionFiles,
         [Parameter(Mandatory)][string]$SharedSessionsPath,
@@ -148,55 +368,95 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $validCandidates = @(
         $candidates |
             Select-Object -Unique |
-            Where-Object {
-                (Test-Path -LiteralPath (Join-Path $_ 'Global.ini') -PathType Leaf) -and
-                (Test-Path -LiteralPath (Join-Path $_ 'Sessions') -PathType Container)
-            }
+            Where-Object { Test-CompleteConfiguration -Path $_ }
     )
 
-    if ($validCandidates.Count -eq 0) {
-        $tried = ($candidates | Select-Object -Unique) -join "`n  "
-        throw "Could not find the synced SecureCRT configuration. Tried:`n  $tried"
-    }
     if ($validCandidates.Count -gt 1) {
         $found = $validCandidates -join "`n  "
         throw "More than one SecureCRT configuration was found. Re-run with -ConfigPath:`n  $found"
     }
 
-    $ConfigPath = $validCandidates[0]
+    if ($validCandidates.Count -eq 1) {
+        $ConfigPath = $validCandidates[0]
+    } else {
+        $oneDriveRoots = @(
+            @(
+                foreach ($variableName in 'OneDriveConsumer', 'OneDrive', 'OneDriveCommercial') {
+                    $oneDriveRoot = [Environment]::GetEnvironmentVariable($variableName, 'Process')
+                    if (-not [string]::IsNullOrWhiteSpace($oneDriveRoot) -and
+                        (Test-Path -LiteralPath $oneDriveRoot -PathType Container)) {
+                        (Get-Item -LiteralPath $oneDriveRoot).FullName
+                    }
+                }
+            ) | Select-Object -Unique
+        )
+        if ($oneDriveRoots.Count -eq 0) {
+            throw 'Could not find a OneDrive folder. Re-run with -ConfigPath.'
+        }
+        if ($oneDriveRoots.Count -gt 1) {
+            $found = $oneDriveRoots -join "`n  "
+            throw @"
+More than one OneDrive folder was found. Re-run with -ConfigPath for the new
+shared Config folder:
+  $found
+"@
+        }
+        $ConfigPath = Join-Path $oneDriveRoots[0] 'SecureCRT\Config'
+    }
+}
+
+$ConfigPath = [IO.Path]::GetFullPath($ConfigPath).TrimEnd([char[]]'\/')
+if (-not (Test-CompleteConfiguration -Path $ConfigPath)) {
+    if (Test-Path -LiteralPath $ConfigPath) {
+        throw @"
+The target configuration exists but is incomplete: $ConfigPath
+Move or repair that folder, then retry; setup will not overwrite it.
+"@
+    }
+
+    $configuredSource = Get-OptionalRegistryValue -Path $RegistryPath -Name 'Config Path'
+    $migrationSource = $null
+    if (-not [string]::IsNullOrWhiteSpace($configuredSource) -and
+        (Test-CompleteConfiguration -Path $configuredSource)) {
+        $migrationSource = Get-NormalizedDirectory -Path $configuredSource
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        $defaultSources = @(
+            (Join-Path $env:APPDATA 'VanDyke\Config'),
+            (Join-Path $env:APPDATA 'VanDyke\SecureCRT\Config')
+        )
+        $validDefaultSources = @(
+            $defaultSources |
+                Select-Object -Unique |
+                Where-Object { Test-CompleteConfiguration -Path $_ }
+        )
+        if ($validDefaultSources.Count -gt 1) {
+            $found = $validDefaultSources -join "`n  "
+            throw "More than one local SecureCRT configuration was found:`n  $found"
+        }
+        if ($validDefaultSources.Count -eq 1) {
+            $migrationSource = Get-NormalizedDirectory -Path $validDefaultSources[0]
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($migrationSource)) {
+        throw @"
+The shared configuration does not exist yet, and no existing local SecureCRT
+configuration was found to migrate. Expected target: $ConfigPath
+"@
+    }
+
+    Copy-ConfigurationAtomically -Source $migrationSource -Destination $ConfigPath
 }
 
 $ConfigPath = Get-NormalizedDirectory -Path $ConfigPath
 $globalIni = Join-Path $ConfigPath 'Global.ini'
 $sessionsPath = Join-Path $ConfigPath 'Sessions'
-
-if (-not (Test-Path -LiteralPath $globalIni -PathType Leaf)) {
-    throw "Global.ini not found in the configuration folder: $ConfigPath"
-}
-if (-not (Test-Path -LiteralPath $sessionsPath -PathType Container)) {
-    throw "SecureCRT Sessions folder not found: $sessionsPath"
-}
+Assert-ShareableConfiguration -Path $ConfigPath
 
 $sessionFiles = @(
     Get-ChildItem -LiteralPath $sessionsPath -File -Filter '*.ini' -Recurse
 )
-$sensitiveFiles = @(
-    $sessionFiles |
-        Select-String -Pattern @(
-            'S:"[^"]*(?:Password|Passphrase)[^"]*"=.+$',
-            'D:"Session Password Saved"=00000001$'
-        ) |
-        ForEach-Object Path |
-        Sort-Object -Unique
-)
-if ($sensitiveFiles.Count -gt 0) {
-    $fileList = $sensitiveFiles -join "`n  "
-    throw @"
-Refusing to share a configuration that may contain saved credentials.
-Move credentials into SecureCRT's Personal Data folder, then retry. Files:
-  $fileList
-"@
-}
+
+Publish-SetupPackage -SharedConfigurationPath $ConfigPath
 
 if (-not $SkipOneDrivePin) {
     # Mark the whole SecureCRT tree as Always Available. This is the scriptable
@@ -224,10 +484,15 @@ if ([string]::IsNullOrWhiteSpace($PersonalDataPath)) {
 }
 New-Item -ItemType Directory -Path $PersonalDataPath -Force | Out-Null
 $PersonalDataPath = Get-NormalizedDirectory -Path $PersonalDataPath
-$syncedUsernameCount = Sync-SessionUsernames `
+$syncedUsernameCount = Sync-SessionUsername `
     -SessionFiles $sessionFiles `
     -SharedSessionsPath $sessionsPath `
     -PersonalDataPath $PersonalDataPath
+
+$oldAgentPipe = [Environment]::GetEnvironmentVariable(
+    'VANDYKE_SSH_AUTH_SOCK',
+    $AgentEnvironmentTarget
+)
 
 $oldConfigPath = $null
 $oldPersonalDataPath = $null
@@ -246,7 +511,9 @@ if (Test-Path -LiteralPath $registryPath) {
     }
 }
 
-if ($oldConfigPath -ne $ConfigPath -or $oldPersonalDataPath -ne $PersonalDataPath) {
+if ($oldConfigPath -ne $ConfigPath -or
+    $oldPersonalDataPath -ne $PersonalDataPath -or
+    $oldAgentPipe -ne $AgentPipe) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         throw 'LOCALAPPDATA is not set, so the previous settings cannot be backed up.'
     }
@@ -258,6 +525,7 @@ if ($oldConfigPath -ne $ConfigPath -or $oldPersonalDataPath -ne $PersonalDataPat
         RegistryPath = $registryPath
         ConfigPath = $oldConfigPath
         PersonalDataPath = $oldPersonalDataPath
+        VanDykeSshAuthSock = $oldAgentPipe
     } | ConvertTo-Json | Set-Content -LiteralPath $backupPath -Encoding UTF8
     Write-Host "Backed up the previous path settings to $backupPath"
 }
@@ -274,11 +542,30 @@ if ($configuredConfig -ne $ConfigPath -or $configuredPersonal -ne $PersonalDataP
     throw 'SecureCRT registry verification failed.'
 }
 
+[Environment]::SetEnvironmentVariable(
+    'VANDYKE_SSH_AUTH_SOCK',
+    $AgentPipe,
+    $AgentEnvironmentTarget
+)
+$configuredAgentPipe = [Environment]::GetEnvironmentVariable(
+    'VANDYKE_SSH_AUTH_SOCK',
+    $AgentEnvironmentTarget
+)
+if ($configuredAgentPipe -ne $AgentPipe) {
+    throw 'SecureCRT external SSH agent configuration failed.'
+}
+if (-not $testMode) {
+    $env:VANDYKE_SSH_AUTH_SOCK = $AgentPipe
+    Send-EnvironmentChangedNotification
+}
+$sshAgentStatus = $AgentPipe
+
 Write-Host ''
 Write-Host 'SecureCRT OneDrive setup is complete.'
 Write-Host "  Shared configuration: $ConfigPath"
 Write-Host "  Local personal data:  $PersonalDataPath"
 Write-Host "  Saved sessions:        $sessionCount"
 Write-Host "  Synced usernames:      $syncedUsernameCount"
+Write-Host "  External SSH agent:    $sshAgentStatus"
 Write-Host ''
 Write-Host 'Launch SecureCRT normally. No administrator access or Git checkout is required.'

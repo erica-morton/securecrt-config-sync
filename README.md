@@ -6,45 +6,57 @@ private keys local to each computer. Session usernames may be shared as
 ordinary connection metadata.
 
 The project configures SecureCRT; it does not install SecureCRT or OneDrive.
+The 1Password desktop app with its SSH agent enabled is a required part of the
+configuration on both platforms.
 It is not affiliated with or endorsed by VanDyke Software, Inc.
 
 ## What it does
 
-- discovers an existing `OneDrive/SecureCRT/Config` tree;
+- discovers an existing `OneDrive/SecureCRT/Config` tree or safely creates it
+  from the machine's current local SecureCRT configuration;
 - asks SecureCRT and SecureFX to quit cleanly and never force-terminates them;
 - refuses configurations whose session files appear to contain saved
   passwords or passphrases;
 - creates a machine-local Personal Data folder;
 - initializes its session usernames from the shared connection metadata;
 - configures SecureCRT's shared and personal paths on macOS or Windows;
+- connects SecureCRT to the 1Password/OpenSSH agent without copying private
+  keys into its configuration;
 - pins the SecureCRT tree for offline use on Windows;
 - backs up previous path settings before changing them;
-- copies the platform helpers next to the shared `Config` folder; and
+- publishes all platform helpers next to the shared `Config` folder; and
 - verifies its changes and supports safe, idempotent reruns.
 
-## Before the first shared setup
+## Start or join a shared configuration
 
-SecureCRT's Personal Data folder should be enabled before copying an existing
-configuration into OneDrive. In SecureCRT, open **Options > Global Options >
-Configuration Paths**, select a local Personal Data folder, and let SecureCRT
-separate sensitive values. Then close SecureCRT and copy the public
-configuration folder to:
+Keep the three `setup-onedrive-*` files together. A Git checkout is not
+required; they can be obtained by downloading and extracting this repository.
+
+If `OneDrive/SecureCRT/Config` already exists, the helper joins that shared
+configuration. If it does not, the helper finds SecureCRT's currently
+configured local tree and a single OneDrive account, validates the local tree,
+copies it through a temporary staging directory, and creates:
 
 ```text
 OneDrive/SecureCRT/Config
 ```
 
-Do not copy the Personal Data folder, private keys, or license files into the
-shared tree. The helpers intentionally stop if they find common saved-password
-markers in session files.
+The original local configuration is retained as a fallback. Both helpers then
+publish the complete Mac and Windows setup package beside `Config`, allowing
+the next Mac or Windows computer to join directly from OneDrive.
+
+Before originating a new share, using SecureCRT's local Personal Data folder
+is recommended. The helpers reject common saved-password and passphrase
+markers before creating anything in OneDrive; they never migrate the Personal
+Data folder or private keys.
 
 ## macOS setup
 
-Keep the three `setup-onedrive-*` files together, then run:
+Run through `bash` so setup also works when OneDrive has not retained the
+script's executable permission:
 
 ```bash
-chmod +x setup-onedrive-macos.sh
-./setup-onedrive-macos.sh
+bash ./setup-onedrive-macos.sh
 ```
 
 The default paths are:
@@ -60,23 +72,32 @@ Local personal data:
 If discovery is ambiguous:
 
 ```bash
-./setup-onedrive-macos.sh \
+bash ./setup-onedrive-macos.sh \
   --config "/path/to/OneDrive/SecureCRT/Config" \
   --personal "/path/to/local/Config.personal"
 ```
 
-The Mac helper copies itself and the Windows helpers into the OneDrive
+The Mac helper can originate or join the share. It requires the 1Password SSH
+agent socket and creates a user
+LaunchAgent so SecureCRT opened from Finder or the Dock inherits that socket
+after every login. If 1Password or its agent is unavailable, interactive setup
+shows the required steps, waits, retests, and continues when the agent is
+ready. It also copies itself and the Windows helpers into the OneDrive
 `SecureCRT` folder.
 
 ## Windows setup
 
-After OneDrive synchronizes the `SecureCRT` folder, double-click:
+On the first Windows computer, extract the three helpers together and
+double-click the CMD file. On later computers, open the synchronized
+`OneDrive\SecureCRT` folder and double-click the same file:
 
 ```text
 setup-onedrive-windows.cmd
 ```
 
-No administrator access is required. The default Personal Data folder is:
+The setup itself does not require administrator access, though disabling the
+Windows OpenSSH Authentication Agent service may require elevation once. The
+default Personal Data folder is:
 
 ```text
 %APPDATA%\VanDyke\SecureCRT\Config.personal
@@ -88,6 +109,16 @@ For an explicit shared configuration path, run PowerShell:
 .\setup-onedrive-windows.ps1 `
   -ConfigPath 'C:\path\to\OneDrive\SecureCRT\Config'
 ```
+
+The Windows helper can originate or join the share and publishes the Mac and
+Windows helpers into it. It requires 1Password to be running with **Settings >
+Developer > Use the SSH Agent** enabled. It verifies that the 1Password agent owns the
+standard `\\.\pipe\openssh-ssh-agent` pipe, then sets SecureCRT's
+`VANDYKE_SSH_AUTH_SOCK` user environment variable to that pipe. If the Windows
+OpenSSH Authentication Agent service is running, setup explains how to stop
+and disable it so 1Password can own the pipe. Interactive setup waits while
+those steps are completed, retests the agent, and then continues. A
+non-interactive run fails fast instead of hanging.
 
 ## Daily use
 
@@ -106,12 +137,17 @@ data. During setup, the helpers also merge those usernames into the local
 Personal Data tree without replacing existing credential fields. Credentials,
 Personal Data, and private key material stay local.
 
+Agent integration authenticates primary connections only. It does not enable
+SSH agent forwarding into remote hosts.
+
 ## Tests and limits
 
-GitHub Actions runs native integration tests on macOS and Windows. Tests cover
+GitHub Actions runs native integration tests on macOS and Windows and applies
+PSScriptAnalyzer to every PowerShell file. Tests cover
 path discovery, saved-credential rejection, backup creation, preferences and
 registry writes, helper deployment, validation failures, CMD argument
-forwarding, session counts, and idempotent reruns.
+forwarding, session counts, first-machine migrations, pre-copy credential
+safety, external-agent settings, and idempotent reruns.
 
 Hosted CI cannot authenticate to a real OneDrive account or launch a licensed
 SecureCRT installation. OneDrive hydration and the first actual SecureCRT

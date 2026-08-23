@@ -6,9 +6,17 @@ installer="$repo_root/setup-onedrive-macos.sh"
 template_dir="$(dirname "$installer")"
 test_root="$(mktemp -d)"
 preferences_domain="io.github.securecrtconfigsync.test.$$"
+migration_domain="io.github.securecrtconfigsync.migration.test.$$"
+unsafe_migration_domain="io.github.securecrtconfigsync.unsafe-migration.test.$$"
+agent_pid=""
 
 cleanup() {
   defaults delete "$preferences_domain" >/dev/null 2>&1 || true
+  defaults delete "$migration_domain" >/dev/null 2>&1 || true
+  defaults delete "$unsafe_migration_domain" >/dev/null 2>&1 || true
+  if [ -n "$agent_pid" ]; then
+    kill "$agent_pid" >/dev/null 2>&1 || true
+  fi
   rm -rf "$test_root"
 }
 trap cleanup EXIT
@@ -35,11 +43,55 @@ mkdir -p "$personal_path/Sessions/Example Group"
 printf '\357\273\277S:"Password V2"=preserve-me\r\nS:"Username"=wrong-user\r\n' \
   >"$personal_path/Sessions/Example Group/host-one.ini"
 
+gate_home="$test_root/gate-home"
+gate_personal="$test_root/gate-personal"
+gate_output="$test_root/gate-output.txt"
+if HOME="$gate_home" \
+    SECURECRT_SYNC_ONEPASSWORD_APP="$test_root/missing-1Password.app" \
+    SECURECRT_SYNC_ONEPASSWORD_SOCKET="$test_root/missing-agent.sock" \
+    "$installer" \
+    --config "$config_path" \
+    --personal "$gate_personal" \
+    --preferences-domain "$preferences_domain" \
+    </dev/null >"$gate_output" 2>&1; then
+  echo "The installer accepted a missing 1Password SSH agent." >&2
+  exit 1
+fi
+grep -Fq '1Password SSH agent setup is required' "$gate_output"
+grep -Fq 'Setup is non-interactive' "$gate_output"
+if [ -e "$gate_personal" ] || [ -e "$gate_home/Library/LaunchAgents" ]; then
+  echo "The installer changed local configuration before the agent readiness gate." >&2
+  exit 1
+fi
+
+agent_socket="$test_root/1password-agent.sock"
+onepassword_app="$test_root/1Password.app"
+launchctl_state="$test_root/launchctl-ssh-auth-sock"
+mock_launchctl="$test_root/mock-launchctl.sh"
+mkdir -p "$onepassword_app"
+eval "$(/usr/bin/ssh-agent -a "$agent_socket" -s)" >/dev/null
+agent_pid="$SSH_AGENT_PID"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  'case "$1" in' \
+  '  setenv) printf "%s" "$3" >"$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
+  '  getenv) [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_STATE" ] || cat "$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
+  '  bootout|bootstrap) ;;' \
+  '  *) exit 1 ;;' \
+  'esac' >"$mock_launchctl"
+chmod 0755 "$mock_launchctl"
+
 defaults write "$preferences_domain" "Config Path" -string "/previous/config"
 defaults write "$preferences_domain" "Personal Data Path" -string "/previous/personal"
 
 first_output="$(
-  HOME="$test_root/home" "$installer" \
+  HOME="$test_root/home" \
+  SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+  SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
     --preferences-domain "$preferences_domain"
@@ -52,6 +104,10 @@ assert_equal "$normalized_personal" "$(defaults read "$preferences_domain" "Pers
 
 printf '%s\n' "$first_output" | grep -Eq 'Saved sessions: +2'
 printf '%s\n' "$first_output" | grep -Eq 'Synced usernames: +2'
+printf '%s\n' "$first_output" | grep -Fq "External SSH agent:    $agent_socket"
+assert_equal "$agent_socket" "$(cat "$launchctl_state")" "GUI SSH agent socket"
+launch_agent="$test_root/home/Library/LaunchAgents/com.securecrt-config-sync.ssh-agent.plist"
+grep -Fq "$agent_socket" "$launch_agent"
 grep -Fq 'S:"Username"=erica' "$personal_path/Sessions/Example Group/host-one.ini"
 grep -Fq 'S:"Password V2"=preserve-me' "$personal_path/Sessions/Example Group/host-one.ini"
 grep -Fq 'S:"Username"=root' "$personal_path/Sessions/Example Group/VMs/host-two.ini"
@@ -63,15 +119,82 @@ backup_dir="$test_root/home/Library/Application Support/VanDyke/SecureCRT/Setup 
 backup_count="$(find "$backup_dir" -type f -name 'configuration-paths-*.txt' | wc -l | tr -d ' ')"
 assert_equal "1" "$backup_count" "first-run backup count"
 
-HOME="$test_root/home" "$installer" \
+HOME="$test_root/home" \
+SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+"$installer" \
   --config "$config_path" \
   --personal "$personal_path" \
   --preferences-domain "$preferences_domain" >/dev/null
 backup_count="$(find "$backup_dir" -type f -name 'configuration-paths-*.txt' | wc -l | tr -d ' ')"
 assert_equal "1" "$backup_count" "second-run backup count"
 
-if HOME="$test_root/home" "$installer" \
-    --config "$test_root/missing" \
+migration_home="$test_root/migration-home"
+migration_source="$migration_home/Library/Application Support/VanDyke/SecureCRT/Config"
+migration_one_drive="$migration_home/Library/CloudStorage/OneDrive-Origin"
+migration_target="$migration_one_drive/SecureCRT/Config"
+migration_personal="$migration_home/Library/Application Support/VanDyke/SecureCRT/Config.personal"
+mkdir -p "$(dirname "$migration_source")" "$migration_one_drive"
+/usr/bin/ditto "$config_path" "$migration_source"
+defaults write "$migration_domain" "Config Path" -string "$migration_source"
+
+migration_output="$(
+  HOME="$migration_home" \
+  SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+  SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  bash "$installer" \
+    --personal "$migration_personal" \
+    --preferences-domain "$migration_domain"
+)"
+printf '%s\n' "$migration_output" | grep -Fq 'Migrated the existing SecureCRT configuration:'
+normalized_migration_target="$(cd "$migration_target" && pwd -P)"
+assert_equal "$normalized_migration_target" "$(defaults read "$migration_domain" "Config Path")" \
+  "migrated Config Path"
+diff -qr "$migration_source" "$migration_target" >/dev/null
+[ -d "$migration_source" ]
+cmp "$template_dir/setup-onedrive-macos.sh" "$migration_one_drive/SecureCRT/setup-onedrive-macos.sh"
+cmp "$template_dir/setup-onedrive-windows.ps1" "$migration_one_drive/SecureCRT/setup-onedrive-windows.ps1"
+cmp "$template_dir/setup-onedrive-windows.cmd" "$migration_one_drive/SecureCRT/setup-onedrive-windows.cmd"
+
+unsafe_migration_home="$test_root/unsafe-migration-home"
+unsafe_migration_source="$unsafe_migration_home/Library/Application Support/VanDyke/SecureCRT/Config"
+unsafe_migration_one_drive="$unsafe_migration_home/Library/CloudStorage/OneDrive-Origin"
+unsafe_migration_target="$unsafe_migration_one_drive/SecureCRT/Config"
+unsafe_migration_personal="$unsafe_migration_home/Library/Application Support/VanDyke/SecureCRT/Config.personal"
+mkdir -p "$(dirname "$unsafe_migration_source")" "$unsafe_migration_one_drive"
+/usr/bin/ditto "$config_path" "$unsafe_migration_source"
+printf 'S:"Password V2"=do-not-sync\n' \
+  >"$unsafe_migration_source/Sessions/Example Group/unsafe.ini"
+defaults write "$unsafe_migration_domain" "Config Path" -string "$unsafe_migration_source"
+if HOME="$unsafe_migration_home" \
+    SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+    SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+    SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+    SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+    bash "$installer" \
+    --personal "$unsafe_migration_personal" \
+    --preferences-domain "$unsafe_migration_domain" >/dev/null 2>&1; then
+  echo "The installer migrated a local configuration containing credentials." >&2
+  exit 1
+fi
+if [ -e "$unsafe_migration_target" ] || [ -e "$unsafe_migration_personal" ]; then
+  echo "The unsafe migration changed OneDrive or Personal Data before validation." >&2
+  exit 1
+fi
+
+partial_config="$test_root/missing"
+mkdir -p "$partial_config"
+if HOME="$test_root/home" \
+    SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+    SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+    SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+    SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+    "$installer" \
+    --config "$partial_config" \
     --personal "$personal_path" \
     --preferences-domain "$preferences_domain" >/dev/null 2>&1; then
   echo "Expected an incomplete configuration to fail." >&2
@@ -79,7 +202,12 @@ if HOME="$test_root/home" "$installer" \
 fi
 
 printf 'S:"Password V2"=do-not-sync\n' >"$session_group/unsafe.ini"
-if HOME="$test_root/home" "$installer" \
+if HOME="$test_root/home" \
+    SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+    SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+    SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+    SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+    "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
     --preferences-domain "$preferences_domain" >/dev/null 2>&1; then
