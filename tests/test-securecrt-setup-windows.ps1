@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $installer = Join-Path $repoRoot 'setup-onedrive-windows.ps1'
 $wrapper = Join-Path $repoRoot 'setup-onedrive-windows.cmd'
+$disconnect = Join-Path $repoRoot 'disconnect-onedrive-windows.ps1'
+$disconnectWrapper = Join-Path $repoRoot 'disconnect-onedrive-windows.cmd'
 $testId = [Guid]::NewGuid().ToString('N')
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) "securecrt-setup-$testId"
 $registryRoot = 'HKCU:\Software\SecureCRTConfigSyncTests'
@@ -14,6 +16,12 @@ $registryPath = Join-Path $registryRoot $testId
 $wrapperRegistryPath = Join-Path $registryRoot "$testId-wrapper"
 $migrationRegistryPath = Join-Path $registryRoot "$testId-migration"
 $unsafeMigrationRegistryPath = Join-Path $registryRoot "$testId-unsafe-migration"
+$legacyRegistryPath = Join-Path $registryRoot "$testId-legacy"
+$statePath = Join-Path $testRoot 'State\onedrive-sync.json'
+$migrationStatePath = Join-Path $testRoot 'MigrationState\onedrive-sync.json'
+$unsafeMigrationStatePath = Join-Path $testRoot 'UnsafeMigrationState\onedrive-sync.json'
+$wrapperStatePath = Join-Path $testRoot 'WrapperState\onedrive-sync.json'
+$legacyStatePath = Join-Path $testRoot 'LegacyState\onedrive-sync.json'
 $oldLocalAppData = $env:LOCALAPPDATA
 $oldCI = $env:CI
 $oldOneDriveConsumer = $env:OneDriveConsumer
@@ -92,6 +100,7 @@ try {
             -ConfigPath (Join-Path $testRoot 'not-yet-configured') `
             -PersonalDataPath $gatePersonalPath `
             -RegistryPath $registryPath `
+            -StatePath $statePath `
             -SkipOneDrivePin
     } catch {
         $gateError = $_.Exception.Message
@@ -101,6 +110,9 @@ try {
     }
     if (Test-Path -LiteralPath $gatePersonalPath) {
         throw 'The installer created Personal Data before the agent readiness gate.'
+    }
+    if (Test-Path -LiteralPath $statePath) {
+        throw 'The installer created rollback state before the agent readiness gate.'
     }
 
     $env:SECURECRT_CONFIG_SYNC_TEST_AGENT_STATE = 'ready'
@@ -125,6 +137,7 @@ try {
         -ConfigPath $configPath `
         -PersonalDataPath $personalPath `
         -RegistryPath $registryPath `
+        -StatePath $statePath `
         -SkipOneDrivePin 6>&1 | Out-String
 
     Assert-Equal $configPath `
@@ -163,7 +176,8 @@ try {
         throw 'The missing Personal Data session was not initialized.'
     }
     foreach ($helper in 'setup-onedrive-macos.sh', 'setup-onedrive-windows.ps1',
-        'setup-onedrive-windows.cmd') {
+        'setup-onedrive-windows.cmd', 'disconnect-onedrive-macos.sh',
+        'disconnect-onedrive-windows.ps1', 'disconnect-onedrive-windows.cmd') {
         $publishedHelper = Join-Path (Split-Path -Parent $configPath) $helper
         Assert-Equal `
             (Get-FileHash -LiteralPath (Join-Path $repoRoot $helper) -Algorithm SHA256).Hash `
@@ -180,14 +194,105 @@ try {
     Assert-Equal 0 $backup.StorePersonalDataSeparately `
         'backed-up Store Personal Data Separately'
     Assert-Equal 'previous-agent' $backup.VanDykeSshAuthSock 'backed-up SSH agent pipe'
+    $setupState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    Assert-Equal $true $setupState.Active 'active setup state'
+    Assert-Equal 'C:\previous\config' $setupState.ConfigPathBefore `
+        'recorded previous Config Path'
 
     & $installer `
         -ConfigPath $configPath `
         -PersonalDataPath $personalPath `
         -RegistryPath $registryPath `
+        -StatePath $statePath `
         -SkipOneDrivePin | Out-Null
     $backups = @(Get-ChildItem -LiteralPath $backupDirectory -Filter '*.json' -File)
     Assert-Equal 1 $backups.Count 'second-run backup count'
+
+    $dryRunOutput = & $disconnect -StatePath $statePath -DryRun 6>&1 | Out-String
+    if ($dryRunOutput -notmatch 'SecureCRT disconnect dry run:') {
+        throw "Disconnect did not report its dry run:`n$dryRunOutput"
+    }
+    Assert-Equal $configPath `
+        (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Config Path') `
+        'Config Path after disconnect dry run'
+    $setupState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    Assert-Equal $true $setupState.Active 'setup state after disconnect dry run'
+
+    New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' `
+        -PropertyType String -Value 'C:\user\changed\personal' -Force | Out-Null
+    $disconnectOutput = & $disconnect -StatePath $statePath 6>&1 | Out-String
+    if ($disconnectOutput -notmatch 'SecureCRT disconnected:') {
+        throw "Disconnect did not report completion:`n$disconnectOutput"
+    }
+    if ($disconnectOutput -notmatch
+        'left unchanged: Personal Data path changed after setup') {
+        throw "Disconnect did not report its ownership guard:`n$disconnectOutput"
+    }
+    Assert-Equal 'C:\previous\config' `
+        (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Config Path') `
+        'restored Config Path'
+    Assert-Equal 'C:\user\changed\personal' `
+        (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Personal Data Path') `
+        'preserved user-changed Personal Data Path'
+    Assert-Equal 0 `
+        (Get-ItemPropertyValue -LiteralPath $registryPath `
+            -Name 'Store Personal Data Separately') `
+        'restored Personal Data separation setting'
+    Assert-Equal 'previous-agent' $env:VANDYKE_SSH_AUTH_SOCK `
+        'restored external-agent environment value'
+    $setupState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    Assert-Equal $false $setupState.Active 'inactive setup state'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Container) -or
+        -not (Test-Path -LiteralPath $personalPath -PathType Container)) {
+        throw 'Disconnect removed shared configuration or Personal Data.'
+    }
+    $secondDisconnectOutput = & $disconnect -StatePath $statePath 6>&1 | Out-String
+    if ($secondDisconnectOutput -notmatch 'already disconnected') {
+        throw "Second disconnect was not idempotent:`n$secondDisconnectOutput"
+    }
+
+    $legacyPersonalPath = Join-Path $testRoot 'LegacyPersonal\Config.personal'
+    New-Item -Path $legacyRegistryPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $legacyRegistryPath -Name 'Config Path' `
+        -PropertyType String -Value $configPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $legacyRegistryPath -Name 'Personal Data Path' `
+        -PropertyType String -Value $legacyPersonalPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $legacyRegistryPath `
+        -Name 'Store Personal Data Separately' -PropertyType DWord `
+        -Value 1 -Force | Out-Null
+    $env:VANDYKE_SSH_AUTH_SOCK = '\\.\pipe\openssh-ssh-agent'
+    $legacyBackupPath = Join-Path $backupDirectory `
+        'configuration-paths-legacy-test.json'
+    [ordered]@{
+        RegistryPath = $legacyRegistryPath
+        ConfigPath = 'C:\legacy\config'
+        PersonalDataPath = 'C:\legacy\personal'
+        StorePersonalDataSeparately = 0
+        VanDykeSshAuthSock = 'legacy-agent'
+    } | ConvertTo-Json | Set-Content -LiteralPath $legacyBackupPath -Encoding UTF8
+
+    & $installer `
+        -ConfigPath $configPath `
+        -PersonalDataPath $legacyPersonalPath `
+        -RegistryPath $legacyRegistryPath `
+        -StatePath $legacyStatePath `
+        -SkipOneDrivePin | Out-Null
+    $legacySetupState = Get-Content -LiteralPath $legacyStatePath -Raw |
+        ConvertFrom-Json
+    Assert-Equal 'C:\legacy\config' $legacySetupState.ConfigPathBefore `
+        'legacy rollback Config Path'
+    Assert-Equal 'legacy-agent' $legacySetupState.VanDykeSshAuthSockBefore `
+        'legacy rollback external-agent value'
+
+    & $disconnect -StatePath $legacyStatePath | Out-Null
+    Assert-Equal 'C:\legacy\config' `
+        (Get-ItemPropertyValue -LiteralPath $legacyRegistryPath -Name 'Config Path') `
+        'legacy restored Config Path'
+    Assert-Equal 'legacy-agent' $env:VANDYKE_SSH_AUTH_SOCK `
+        'legacy restored external-agent value'
+    if (-not (Test-Path -LiteralPath $legacyPersonalPath -PathType Container)) {
+        throw 'Legacy disconnect removed Personal Data.'
+    }
 
     $migrationSource = New-TestConfiguration -Root (Join-Path $testRoot 'LocalOrigin')
     $migrationOneDrive = Join-Path $testRoot 'OriginOneDrive'
@@ -206,6 +311,7 @@ try {
     $migrationOutput = & $installer `
         -PersonalDataPath $migrationPersonal `
         -RegistryPath $migrationRegistryPath `
+        -StatePath $migrationStatePath `
         -SkipOneDrivePin 6>&1 | Out-String
     if ($migrationOutput -notmatch 'Migrated the existing SecureCRT configuration:') {
         throw "The installer did not report the Windows-origin migration:`n$migrationOutput"
@@ -226,7 +332,8 @@ try {
         throw 'The Windows-origin migration removed the original local configuration.'
     }
     foreach ($helper in 'setup-onedrive-macos.sh', 'setup-onedrive-windows.ps1',
-        'setup-onedrive-windows.cmd') {
+        'setup-onedrive-windows.cmd', 'disconnect-onedrive-macos.sh',
+        'disconnect-onedrive-windows.ps1', 'disconnect-onedrive-windows.cmd') {
         $publishedHelper = Join-Path (Split-Path -Parent $migrationTarget) $helper
         Assert-Equal `
             (Get-FileHash -LiteralPath (Join-Path $repoRoot $helper) -Algorithm SHA256).Hash `
@@ -250,6 +357,7 @@ try {
         & $installer `
             -PersonalDataPath $unsafeMigrationPersonal `
             -RegistryPath $unsafeMigrationRegistryPath `
+            -StatePath $unsafeMigrationStatePath `
             -SkipOneDrivePin | Out-Null
     } catch {
         $unsafeMigrationError = $_.Exception.Message
@@ -258,7 +366,8 @@ try {
         throw "The unsafe Windows-origin migration did not fail safely: $unsafeMigrationError"
     }
     if ((Test-Path -LiteralPath $unsafeMigrationTarget) -or
-        (Test-Path -LiteralPath $unsafeMigrationPersonal)) {
+        (Test-Path -LiteralPath $unsafeMigrationPersonal) -or
+        (Test-Path -LiteralPath $unsafeMigrationStatePath)) {
         throw 'The unsafe Windows-origin migration wrote shared or Personal Data files.'
     }
 
@@ -268,6 +377,7 @@ try {
         -ConfigPath $configPath `
         -PersonalDataPath $wrapperPersonalPath `
         -RegistryPath $wrapperRegistryPath `
+        -StatePath $wrapperStatePath `
         -SkipOneDrivePin
     if ($LASTEXITCODE -ne 0) {
         throw "The CMD wrapper failed with exit code $LASTEXITCODE."
@@ -279,6 +389,10 @@ try {
         (Get-ItemPropertyValue -LiteralPath $wrapperRegistryPath `
             -Name 'Store Personal Data Separately') `
         'wrapper Store Personal Data Separately'
+    & $disconnectWrapper -StatePath $wrapperStatePath -DryRun
+    if ($LASTEXITCODE -ne 0) {
+        throw "The disconnect CMD wrapper failed with exit code $LASTEXITCODE."
+    }
 
     $oneDriveA = Join-Path $testRoot 'OneDriveA'
     $oneDriveB = Join-Path $testRoot 'OneDriveB'
@@ -346,5 +460,6 @@ try {
     Remove-Item -LiteralPath $wrapperRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $migrationRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $unsafeMigrationRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $legacyRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

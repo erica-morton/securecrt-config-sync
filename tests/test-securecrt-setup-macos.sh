@@ -3,17 +3,20 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 installer="$repo_root/setup-onedrive-macos.sh"
+disconnect="$repo_root/disconnect-onedrive-macos.sh"
 template_dir="$(dirname "$installer")"
 test_root="$(mktemp -d)"
 preferences_domain="io.github.securecrtconfigsync.test.$$"
 migration_domain="io.github.securecrtconfigsync.migration.test.$$"
 unsafe_migration_domain="io.github.securecrtconfigsync.unsafe-migration.test.$$"
+legacy_domain="io.github.securecrtconfigsync.legacy.test.$$"
 agent_pid=""
 
 cleanup() {
   defaults delete "$preferences_domain" >/dev/null 2>&1 || true
   defaults delete "$migration_domain" >/dev/null 2>&1 || true
   defaults delete "$unsafe_migration_domain" >/dev/null 2>&1 || true
+  defaults delete "$legacy_domain" >/dev/null 2>&1 || true
   if [ -n "$agent_pid" ]; then
     kill "$agent_pid" >/dev/null 2>&1 || true
   fi
@@ -102,11 +105,18 @@ printf '%s\n' \
   'set -eu' \
   'case "$1" in' \
   '  setenv) printf "%s" "$3" >"$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
+  '  unsetenv) : >"$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  getenv) [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_STATE" ] || cat "$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  bootout|bootstrap) ;;' \
   '  *) exit 1 ;;' \
   'esac' >"$mock_launchctl"
 chmod 0755 "$mock_launchctl"
+printf '%s' '/previous/gui-agent.sock' >"$launchctl_state"
+
+previous_launch_agent='previous launch agent content'
+launch_agent="$test_root/home/Library/LaunchAgents/com.securecrt-config-sync.ssh-agent.plist"
+mkdir -p "$(dirname "$launch_agent")"
+printf '%s\n' "$previous_launch_agent" >"$launch_agent"
 
 defaults write "$preferences_domain" "Config Path" -string "/previous/config"
 defaults write "$preferences_domain" "Personal Data Path" -string "/previous/personal"
@@ -136,7 +146,6 @@ printf '%s\n' "$first_output" | grep -Eq 'Saved sessions: +2'
 printf '%s\n' "$first_output" | grep -Eq 'Synced usernames: +2'
 printf '%s\n' "$first_output" | grep -Fq "External SSH agent:    $agent_socket"
 assert_equal "$agent_socket" "$(cat "$launchctl_state")" "GUI SSH agent socket"
-launch_agent="$test_root/home/Library/LaunchAgents/com.securecrt-config-sync.ssh-agent.plist"
 grep -Fq "$agent_socket" "$launch_agent"
 grep -Fq 'S:"Username"=erica' "$personal_path/Sessions/Example Group/host-one.ini"
 grep -Fq 'S:"Password V2"=preserve-me' "$personal_path/Sessions/Example Group/host-one.ini"
@@ -144,6 +153,16 @@ grep -Fq 'S:"Username"=root' "$personal_path/Sessions/Example Group/VMs/host-two
 cmp "$template_dir/setup-onedrive-macos.sh" "$test_root/OneDrive/SecureCRT/setup-onedrive-macos.sh"
 cmp "$template_dir/setup-onedrive-windows.ps1" "$test_root/OneDrive/SecureCRT/setup-onedrive-windows.ps1"
 cmp "$template_dir/setup-onedrive-windows.cmd" "$test_root/OneDrive/SecureCRT/setup-onedrive-windows.cmd"
+cmp "$template_dir/disconnect-onedrive-macos.sh" "$test_root/OneDrive/SecureCRT/disconnect-onedrive-macos.sh"
+cmp "$template_dir/disconnect-onedrive-windows.ps1" "$test_root/OneDrive/SecureCRT/disconnect-onedrive-windows.ps1"
+cmp "$template_dir/disconnect-onedrive-windows.cmd" "$test_root/OneDrive/SecureCRT/disconnect-onedrive-windows.cmd"
+
+setup_state="$test_root/home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+assert_equal "true" "$(/usr/libexec/PlistBuddy -c 'Print :Active' "$setup_state")" \
+  "active setup state"
+assert_equal "/previous/config" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :ConfigPathBefore' "$setup_state")" \
+  "recorded previous Config Path"
 
 backup_dir="$test_root/home/Library/Application Support/VanDyke/SecureCRT/Setup Backups"
 backup_count="$(find "$backup_dir" -type f -name 'configuration-paths-*.txt' | wc -l | tr -d ' ')"
@@ -162,6 +181,93 @@ SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
   --preferences-domain "$preferences_domain" >/dev/null
 backup_count="$(find "$backup_dir" -type f -name 'configuration-paths-*.txt' | wc -l | tr -d ' ')"
 assert_equal "1" "$backup_count" "second-run backup count"
+
+dry_run_output="$(
+  HOME="$test_root/home" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  bash "$disconnect" --dry-run
+)"
+printf '%s\n' "$dry_run_output" | grep -Fq 'SecureCRT disconnect dry run:'
+assert_equal "$normalized_config" \
+  "$(defaults read "$preferences_domain" "Config Path")" \
+  "Config Path after disconnect dry run"
+assert_equal "true" "$(/usr/libexec/PlistBuddy -c 'Print :Active' "$setup_state")" \
+  "setup state after disconnect dry run"
+
+defaults write "$preferences_domain" "Personal Data Path" -string "/user/changed/personal"
+disconnect_output="$(
+  HOME="$test_root/home" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  bash "$disconnect"
+)"
+printf '%s\n' "$disconnect_output" | grep -Fq 'SecureCRT disconnected:'
+printf '%s\n' "$disconnect_output" | grep -Fq \
+  'left unchanged: Personal Data path changed after setup'
+assert_equal "/previous/config" "$(defaults read "$preferences_domain" "Config Path")" \
+  "restored Config Path"
+assert_equal "/user/changed/personal" \
+  "$(defaults read "$preferences_domain" "Personal Data Path")" \
+  "preserved user-changed Personal Data Path"
+assert_equal "0" \
+  "$(defaults read "$preferences_domain" "Store Personal Data Separately")" \
+  "restored Personal Data separation setting"
+assert_equal "/previous/gui-agent.sock" "$(cat "$launchctl_state")" \
+  "restored GUI SSH agent socket"
+assert_equal "$previous_launch_agent" "$(cat "$launch_agent")" \
+  "restored LaunchAgent"
+assert_equal "false" "$(/usr/libexec/PlistBuddy -c 'Print :Active' "$setup_state")" \
+  "inactive setup state"
+[ -d "$config_path" ]
+[ -d "$personal_path" ]
+
+second_disconnect_output="$(
+  HOME="$test_root/home" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  bash "$disconnect"
+)"
+printf '%s\n' "$second_disconnect_output" | grep -Fq 'already disconnected'
+
+legacy_home="$test_root/legacy-home"
+legacy_local_config="$legacy_home/Library/Application Support/VanDyke/SecureCRT/Config"
+legacy_personal="$legacy_home/Library/Application Support/VanDyke/SecureCRT/Config.personal"
+legacy_launchctl_state="$test_root/legacy-launchctl-ssh-auth-sock"
+mkdir -p "$(dirname "$legacy_local_config")" "$legacy_personal"
+/usr/bin/ditto "$config_path" "$legacy_local_config"
+legacy_local_config="$(cd "$legacy_local_config" && pwd -P)"
+legacy_personal="$(cd "$legacy_personal" && pwd -P)"
+printf '%s' "$agent_socket" >"$legacy_launchctl_state"
+defaults write "$legacy_domain" "Config Path" -string "$normalized_config"
+defaults write "$legacy_domain" "Personal Data Path" -string "$legacy_personal"
+defaults write "$legacy_domain" "Store Personal Data Separately" -bool true
+
+HOME="$legacy_home" \
+SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
+bash "$installer" \
+  --config "$config_path" \
+  --personal "$legacy_personal" \
+  --preferences-domain "$legacy_domain" >/dev/null
+legacy_setup_state="$legacy_home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+assert_equal "$legacy_local_config" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :ConfigPathBefore' "$legacy_setup_state")" \
+  "legacy rollback Config Path"
+assert_equal "false" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :GuiSshAuthSockBeforePresent' "$legacy_setup_state")" \
+  "legacy rollback GUI agent presence"
+
+HOME="$legacy_home" \
+SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
+bash "$disconnect" >/dev/null
+assert_equal "$legacy_local_config" "$(defaults read "$legacy_domain" "Config Path")" \
+  "legacy restored Config Path"
+assert_equal "" "$(cat "$legacy_launchctl_state")" "legacy restored GUI SSH agent socket"
+[ -d "$legacy_personal" ]
 
 migration_home="$test_root/migration-home"
 migration_source="$migration_home/Library/Application Support/VanDyke/SecureCRT/Config"

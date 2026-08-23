@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: setup-onedrive-macos.sh [--config PATH] [--personal PATH]
-                                 [--preferences-domain DOMAIN]
+                                 [--preferences-domain DOMAIN] [--state PATH]
 
 Configures SecureCRT to use the synchronized OneDrive configuration while
 keeping credentials in a machine-local Personal Data folder. 1Password and
@@ -15,6 +15,7 @@ EOF
 config_path=""
 personal_path="$HOME/Library/Application Support/VanDyke/SecureCRT/Config.personal"
 preferences_domain="com.vandyke.SecureCRT"
+state_path=""
 onepassword_app="${SECURECRT_SYNC_ONEPASSWORD_APP:-/Applications/1Password.app}"
 ssh_agent_socket="${SECURECRT_SYNC_ONEPASSWORD_SOCKET:-$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock}"
 launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
@@ -36,6 +37,11 @@ while [ "$#" -gt 0 ]; do
       preferences_domain="$2"
       shift 2
       ;;
+    --state)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      state_path="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -53,11 +59,14 @@ required_helpers=(
   setup-onedrive-macos.sh
   setup-onedrive-windows.ps1
   setup-onedrive-windows.cmd
+  disconnect-onedrive-macos.sh
+  disconnect-onedrive-windows.ps1
+  disconnect-onedrive-windows.cmd
 )
 for helper in "${required_helpers[@]}"; do
   if [ ! -f "$script_dir/$helper" ]; then
     echo "Required setup helper is missing: $script_dir/$helper" >&2
-    echo "Keep all three setup-onedrive-* files together, then retry." >&2
+    echo "Keep all setup-onedrive-* and disconnect-onedrive-* files together, then retry." >&2
     exit 1
   fi
 done
@@ -403,15 +412,225 @@ sync_session_usernames() {
 
 synced_username_count="$(sync_session_usernames "$config_path/Sessions" "$personal_path/Sessions")"
 
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+plist_read() {
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null
+}
+
+write_setup_state() {
+  candidate="$(mktemp "${state_path}.tmp.XXXXXX")"
+  escaped_created_at="$(xml_escape "$state_created_at")"
+  escaped_updated_at="$(xml_escape "$state_updated_at")"
+  escaped_preferences_domain="$(xml_escape "$preferences_domain")"
+  escaped_config_before="$(xml_escape "$state_config_before")"
+  escaped_config_installed="$(xml_escape "$config_path")"
+  escaped_personal_before="$(xml_escape "$state_personal_before")"
+  escaped_personal_installed="$(xml_escape "$personal_path")"
+  escaped_agent_before="$(xml_escape "$state_agent_before")"
+  escaped_agent_installed="$(xml_escape "$ssh_agent_socket")"
+  escaped_launch_path="$(xml_escape "$launch_agent_path")"
+  escaped_launch_backup="$(xml_escape "$state_launch_before_backup")"
+  escaped_launch_hash="$(xml_escape "$state_installed_launch_hash")"
+  config_before_boolean='<false/>'
+  personal_before_boolean='<false/>'
+  store_before_boolean='<false/>'
+  agent_before_boolean='<false/>'
+  launch_before_boolean='<false/>'
+  [ "$state_config_before_present" = true ] && config_before_boolean='<true/>'
+  [ "$state_personal_before_present" = true ] && personal_before_boolean='<true/>'
+  [ "$state_store_before_present" = true ] && store_before_boolean='<true/>'
+  [ "$state_agent_before_present" = true ] && agent_before_boolean='<true/>'
+  [ "$state_launch_before_present" = true ] && launch_before_boolean='<true/>'
+
+  cat >"$candidate" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Version</key><integer>1</integer>
+  <key>Active</key><true/>
+  <key>CreatedAt</key><string>$escaped_created_at</string>
+  <key>UpdatedAt</key><string>$escaped_updated_at</string>
+  <key>PreferencesDomain</key><string>$escaped_preferences_domain</string>
+  <key>ConfigPathBeforePresent</key>$config_before_boolean
+  <key>ConfigPathBefore</key><string>$escaped_config_before</string>
+  <key>ConfigPathInstalled</key><string>$escaped_config_installed</string>
+  <key>PersonalDataPathBeforePresent</key>$personal_before_boolean
+  <key>PersonalDataPathBefore</key><string>$escaped_personal_before</string>
+  <key>PersonalDataPathInstalled</key><string>$escaped_personal_installed</string>
+  <key>StorePersonalDataSeparatelyBeforePresent</key>$store_before_boolean
+  <key>StorePersonalDataSeparatelyBefore</key><integer>$state_store_before</integer>
+  <key>StorePersonalDataSeparatelyInstalled</key><integer>1</integer>
+  <key>GuiSshAuthSockBeforePresent</key>$agent_before_boolean
+  <key>GuiSshAuthSockBefore</key><string>$escaped_agent_before</string>
+  <key>GuiSshAuthSockInstalled</key><string>$escaped_agent_installed</string>
+  <key>LaunchAgentPath</key><string>$escaped_launch_path</string>
+  <key>LaunchAgentBeforePresent</key>$launch_before_boolean
+  <key>LaunchAgentBeforeBackupPath</key><string>$escaped_launch_backup</string>
+  <key>LaunchAgentInstalledSha256</key><string>$escaped_launch_hash</string>
+</dict>
+</plist>
+EOF
+  /usr/bin/plutil -lint "$candidate" >/dev/null
+  chmod 0600 "$candidate"
+  mv "$candidate" "$state_path"
+}
+
+launch_agent_label="com.securecrt-config-sync.ssh-agent"
+launch_agent_dir="$HOME/Library/LaunchAgents"
+launch_agent_path="$launch_agent_dir/$launch_agent_label.plist"
+if [ -z "$state_path" ]; then
+  state_path="$HOME/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+fi
+state_dir="$(dirname "$state_path")"
+mkdir -p "$state_dir"
+state_path="$(cd "$state_dir" && pwd -P)/$(basename "$state_path")"
+state_launch_before_backup="$state_dir/launch-agent-before.plist"
+
+if defaults read "$preferences_domain" "Config Path" >/dev/null 2>&1; then
+  old_config_present=true
+  old_config="$(defaults read "$preferences_domain" "Config Path")"
+else
+  old_config_present=false
+  old_config=""
+fi
+if defaults read "$preferences_domain" "Personal Data Path" >/dev/null 2>&1; then
+  old_personal_present=true
+  old_personal="$(defaults read "$preferences_domain" "Personal Data Path")"
+else
+  old_personal_present=false
+  old_personal=""
+fi
+if defaults read "$preferences_domain" "Store Personal Data Separately" >/dev/null 2>&1; then
+  old_store_personal_present=true
+  old_store_personal="$(defaults read "$preferences_domain" "Store Personal Data Separately")"
+else
+  old_store_personal_present=false
+  old_store_personal="0"
+fi
+old_agent_socket="$($launchctl_bin getenv SSH_AUTH_SOCK 2>/dev/null || true)"
+
+state_is_active=false
+state_installed_launch_hash=""
+if [ -f "$state_path" ]; then
+  state_version="$(plist_read "$state_path" Version || true)"
+  if [ "$state_version" != "1" ]; then
+    echo "Unsupported SecureCRT setup state version: $state_path" >&2
+    exit 1
+  fi
+  if [ "$(plist_read "$state_path" Active || true)" = "true" ]; then
+    state_is_active=true
+  fi
+fi
+
+if [ "$state_is_active" = true ]; then
+  state_created_at="$(plist_read "$state_path" CreatedAt)"
+  state_config_before_present="$(plist_read "$state_path" ConfigPathBeforePresent)"
+  state_config_before="$(plist_read "$state_path" ConfigPathBefore)"
+  state_personal_before_present="$(plist_read "$state_path" PersonalDataPathBeforePresent)"
+  state_personal_before="$(plist_read "$state_path" PersonalDataPathBefore)"
+  state_store_before_present="$(plist_read "$state_path" StorePersonalDataSeparatelyBeforePresent)"
+  state_store_before="$(plist_read "$state_path" StorePersonalDataSeparatelyBefore)"
+  state_agent_before_present="$(plist_read "$state_path" GuiSshAuthSockBeforePresent)"
+  state_agent_before="$(plist_read "$state_path" GuiSshAuthSockBefore)"
+  state_launch_before_present="$(plist_read "$state_path" LaunchAgentBeforePresent)"
+  state_launch_before_backup="$(plist_read "$state_path" LaunchAgentBeforeBackupPath)"
+  state_installed_launch_hash="$(plist_read "$state_path" LaunchAgentInstalledSha256)"
+else
+  state_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  state_config_before_present="$old_config_present"
+  state_config_before="$old_config"
+  state_personal_before_present="$old_personal_present"
+  state_personal_before="$old_personal"
+  state_store_before_present="$old_store_personal_present"
+  state_store_before="$old_store_personal"
+  state_agent_before_present=false
+  state_agent_before="$old_agent_socket"
+  [ -n "$old_agent_socket" ] && state_agent_before_present=true
+  state_launch_before_present=false
+
+  looks_like_legacy_install=false
+  if [ "$old_config" = "$config_path" ] && [ "$old_personal" = "$personal_path" ] && \
+      [ "$old_store_personal" = "1" ] && [ "$old_agent_socket" = "$ssh_agent_socket" ]; then
+    looks_like_legacy_install=true
+  fi
+
+  backup_dir="$HOME/Library/Application Support/VanDyke/SecureCRT/Setup Backups"
+  latest_path_backup=""
+  if [ -d "$backup_dir" ]; then
+    newest_path_backup=""
+    while IFS= read -r candidate_path_backup; do
+      [ -n "$newest_path_backup" ] || newest_path_backup="$candidate_path_backup"
+      candidate_previous_config="$(sed -n 's/^Config Path=//p' "$candidate_path_backup")"
+      if [ "$candidate_previous_config" != "$config_path" ]; then
+        latest_path_backup="$candidate_path_backup"
+        break
+      fi
+    done < <(find "$backup_dir" -maxdepth 1 -type f \
+      -name 'configuration-paths-*.txt' -print | sort -r)
+    [ -n "$latest_path_backup" ] || latest_path_backup="$newest_path_backup"
+  fi
+  if [ "$looks_like_legacy_install" = true ] && [ -n "$latest_path_backup" ]; then
+    state_config_before="$(sed -n 's/^Config Path=//p' "$latest_path_backup")"
+    state_personal_before="$(sed -n 's/^Personal Data Path=//p' "$latest_path_backup")"
+    state_store_before="$(sed -n 's/^Store Personal Data Separately=//p' "$latest_path_backup")"
+    state_config_before_present=false
+    state_personal_before_present=false
+    state_store_before_present=false
+    [ -n "$state_config_before" ] && state_config_before_present=true
+    [ -n "$state_personal_before" ] && state_personal_before_present=true
+    [ -n "$state_store_before" ] && state_store_before_present=true
+  fi
+  default_local_config="$HOME/Library/Application Support/VanDyke/SecureCRT/Config"
+  if [ "$looks_like_legacy_install" = true ] && \
+      [ "$state_config_before" = "$config_path" ] && \
+      configuration_is_complete "$default_local_config"; then
+    default_local_config="$(cd "$default_local_config" && pwd -P)"
+    state_config_before_present=true
+    state_config_before="$default_local_config"
+    state_personal_before_present=false
+    state_personal_before=""
+    state_store_before_present=false
+    state_store_before="0"
+    state_agent_before_present=false
+    state_agent_before=""
+  fi
+
+  if [ -f "$launch_agent_path" ]; then
+    if [ "$looks_like_legacy_install" = true ] && \
+        grep -Fq "<string>$launch_agent_label</string>" "$launch_agent_path"; then
+      latest_launch_backup=""
+      if [ -d "$backup_dir" ]; then
+        latest_launch_backup="$(find "$backup_dir" -maxdepth 1 -type f \
+          -name 'ssh-agent-launch-agent-*.plist' -print | sort | tail -n 1)"
+      fi
+      if [ -n "$latest_launch_backup" ]; then
+        cp "$latest_launch_backup" "$state_launch_before_backup"
+        state_launch_before_present=true
+      fi
+    else
+      cp "$launch_agent_path" "$state_launch_before_backup"
+      state_launch_before_present=true
+    fi
+  fi
+  if [ "$looks_like_legacy_install" = true ] && [ "$old_agent_socket" = "$ssh_agent_socket" ]; then
+    state_agent_before_present=false
+    state_agent_before=""
+  fi
+fi
+
+state_updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_setup_state
+
 configure_gui_ssh_agent() {
   socket_path="$1"
-  launch_agent_label="com.securecrt-config-sync.ssh-agent"
-  launch_agent_dir="$HOME/Library/LaunchAgents"
-  launch_agent_path="$launch_agent_dir/$launch_agent_label.plist"
   mkdir -p "$launch_agent_dir"
 
-  escaped_socket="$(printf '%s' "$socket_path" | sed \
-    -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  escaped_socket="$(xml_escape "$socket_path")"
   candidate="$(mktemp "${launch_agent_path}.tmp.XXXXXX")"
   cat >"$candidate" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -446,6 +665,10 @@ EOF
     rm "$candidate"
   fi
 
+  state_installed_launch_hash="$(shasum -a 256 "$launch_agent_path" | awk '{print $1}')"
+  state_updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_setup_state
+
   launch_domain="gui/$(id -u)"
   "$launchctl_bin" bootout "$launch_domain" "$launch_agent_path" >/dev/null 2>&1 || true
   "$launchctl_bin" bootstrap "$launch_domain" "$launch_agent_path"
@@ -459,10 +682,10 @@ EOF
 
 configure_gui_ssh_agent "$ssh_agent_socket"
 ssh_agent_status="$ssh_agent_socket"
+state_installed_launch_hash="$(shasum -a 256 "$launch_agent_path" | awk '{print $1}')"
+state_updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_setup_state
 
-old_config="$(defaults read "$preferences_domain" "Config Path" 2>/dev/null || true)"
-old_personal="$(defaults read "$preferences_domain" "Personal Data Path" 2>/dev/null || true)"
-old_store_personal="$(defaults read "$preferences_domain" "Store Personal Data Separately" 2>/dev/null || true)"
 if [ "$old_config" != "$config_path" ] || [ "$old_personal" != "$personal_path" ] || \
     [ "$old_store_personal" != "1" ]; then
   backup_dir="$HOME/Library/Application Support/VanDyke/SecureCRT/Setup Backups"
@@ -501,6 +724,7 @@ for helper in "${required_helpers[@]}"; do
   fi
 done
 chmod 0755 "$securecrt_root/setup-onedrive-macos.sh"
+chmod 0755 "$securecrt_root/disconnect-onedrive-macos.sh"
 
 cat <<EOF
 
@@ -510,6 +734,7 @@ SecureCRT OneDrive setup is complete.
   Saved sessions:        $session_count
   Synced usernames:      $synced_username_count
   External SSH agent:    $ssh_agent_status
+  Disconnect state:      $state_path
 
 The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd

@@ -21,6 +21,7 @@ jobs:
       - name: Validate shell scripts
         run: |
           bash -n setup-onedrive-macos.sh
+          bash -n disconnect-onedrive-macos.sh
           bash -n tests/test-securecrt-setup-macos.sh
 
       - name: Test macOS setup
