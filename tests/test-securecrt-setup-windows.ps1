@@ -35,6 +35,23 @@ function Assert-Equal {
     }
 }
 
+function Assert-FileBackedSshKeysDisabled {
+    param([Parameter(Mandatory)][string]$ConfigurationPath)
+
+    $lines = [IO.File]::ReadAllLines((Join-Path $ConfigurationPath 'SSH2.ini'))
+    Assert-Equal 1 @($lines | Where-Object { $_ -eq 'S:"Identity Filename V2"=' }).Count `
+        'empty global identity filename count'
+    Assert-Equal 1 @($lines | Where-Object {
+        $_ -eq 'D:"Add Private Keys To Agent"=00000000'
+    }).Count 'disabled file-key agent loading count'
+    Assert-Equal 1 @($lines | Where-Object {
+        $_ -eq 'Z:"Agent Keys To Load"=00000000'
+    }).Count 'empty agent preload list count'
+    if ($lines -match '/Users/erica/\.ssh/') {
+        throw 'A macOS private-key path remained in the shared SSH2 configuration.'
+    }
+}
+
 function New-TestConfiguration {
     param([Parameter(Mandatory)][string]$Root)
 
@@ -42,6 +59,15 @@ function New-TestConfiguration {
     $sessionGroup = Join-Path $config 'Sessions\Example Group'
     New-Item -ItemType Directory -Path (Join-Path $sessionGroup 'VMs') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $config 'Global.ini') -Value 'test global configuration'
+    Set-Content -LiteralPath (Join-Path $config 'SSH2.ini') -Value @(
+        'D:"Add Private Keys To Agent"=00000001',
+        'S:"Identity Filename V2"=${VDS_SSH_DATA_PATH}/id_ed25519-erica_github',
+        'D:"Try All Agent Keys"=00000001',
+        'Z:"Agent Keys To Load"=00000003',
+        ' /Users/erica/.ssh/id_ed25519-erica_github',
+        ' /Users/erica/.ssh/id_rsa',
+        ' /Users/erica/.ssh/id_rsa.old'
+    )
     Set-Content -LiteralPath (Join-Path $sessionGroup '__FolderData__.ini') -Value 'folder metadata'
     Set-Content -LiteralPath (Join-Path $sessionGroup 'host-one.ini') `
         -Value @('S:"Hostname"=host-one.example', 'S:"Username"=erica')
@@ -92,6 +118,8 @@ try {
         -PropertyType String -Value 'C:\previous\config' -Force | Out-Null
     New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' `
         -PropertyType String -Value 'C:\previous\personal' -Force | Out-Null
+    New-ItemProperty -LiteralPath $registryPath -Name 'Store Personal Data Separately' `
+        -PropertyType DWord -Value 0 -Force | Out-Null
 
     $firstOutput = & $installer `
         -ConfigPath $configPath `
@@ -105,6 +133,11 @@ try {
     Assert-Equal $personalPath `
         (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Personal Data Path') `
         'Personal Data Path'
+    Assert-Equal 1 `
+        (Get-ItemPropertyValue -LiteralPath $registryPath `
+            -Name 'Store Personal Data Separately') `
+        'Store Personal Data Separately'
+    Assert-FileBackedSshKeysDisabled -ConfigurationPath $configPath
     if (-not (Test-Path -LiteralPath $personalPath -PathType Container)) {
         throw 'The Personal Data folder was not created.'
     }
@@ -144,6 +177,8 @@ try {
     $backup = Get-Content -LiteralPath $backups[0].FullName -Raw | ConvertFrom-Json
     Assert-Equal 'C:\previous\config' $backup.ConfigPath 'backed-up Config Path'
     Assert-Equal 'C:\previous\personal' $backup.PersonalDataPath 'backed-up Personal Data Path'
+    Assert-Equal 0 $backup.StorePersonalDataSeparately `
+        'backed-up Store Personal Data Separately'
     Assert-Equal 'previous-agent' $backup.VanDykeSshAuthSock 'backed-up SSH agent pipe'
 
     & $installer `
@@ -182,6 +217,11 @@ try {
         (Get-FileHash -LiteralPath (Join-Path $migrationSource 'Global.ini') -Algorithm SHA256).Hash `
         (Get-FileHash -LiteralPath (Join-Path $migrationTarget 'Global.ini') -Algorithm SHA256).Hash `
         'migrated Global.ini'
+    Assert-FileBackedSshKeysDisabled -ConfigurationPath $migrationTarget
+    if ((Get-Content -LiteralPath (Join-Path $migrationSource 'SSH2.ini') -Raw) -notmatch
+        '/Users/erica/\.ssh/id_rsa') {
+        throw 'The origin migration modified the original local SSH2 configuration.'
+    }
     if (-not (Test-Path -LiteralPath $migrationSource -PathType Container)) {
         throw 'The Windows-origin migration removed the original local configuration.'
     }
@@ -235,6 +275,10 @@ try {
     Assert-Equal $configPath `
         (Get-ItemPropertyValue -LiteralPath $wrapperRegistryPath -Name 'Config Path') `
         'wrapper Config Path'
+    Assert-Equal 1 `
+        (Get-ItemPropertyValue -LiteralPath $wrapperRegistryPath `
+            -Name 'Store Personal Data Separately') `
+        'wrapper Store Personal Data Separately'
 
     $oneDriveA = Join-Path $testRoot 'OneDriveA'
     $oneDriveB = Join-Path $testRoot 'OneDriveB'

@@ -152,6 +152,72 @@ validate_shareable_configuration() {
   fi
 }
 
+disable_file_backed_ssh_keys() {
+  configuration_path="$1"
+  ssh2_path="$configuration_path/SSH2.ini"
+  [ -f "$ssh2_path" ] || return 0
+
+  temporary_path="$(mktemp "${ssh2_path}.securecrt-config-sync.XXXXXX")"
+  skip_lines=0
+  changed=false
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    line_ending=$'\n'
+    line="$raw_line"
+    case "$line" in
+      *$'\r')
+        line="${line%$'\r'}"
+        line_ending=$'\r\n'
+        ;;
+    esac
+
+    if [ "$skip_lines" -gt 0 ]; then
+      skip_lines=$((skip_lines - 1))
+      changed=true
+      continue
+    fi
+
+    case "$line" in
+      'S:"Identity Filename V2"='*)
+        replacement='S:"Identity Filename V2"='
+        [ "$line" = "$replacement" ] || changed=true
+        printf '%s%s' "$replacement" "$line_ending" >>"$temporary_path"
+        ;;
+      'D:"Add Private Keys To Agent"='*)
+        replacement='D:"Add Private Keys To Agent"=00000000'
+        [ "$line" = "$replacement" ] || changed=true
+        printf '%s%s' "$replacement" "$line_ending" >>"$temporary_path"
+        ;;
+      'Z:"Agent Keys To Load"='*)
+        key_count_hex="${line#*=}"
+        if [[ ! "$key_count_hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
+          rm -f "$temporary_path"
+          echo "The SSH agent key list is malformed: $ssh2_path" >&2
+          return 1
+        fi
+        skip_lines=$((16#$key_count_hex))
+        replacement='Z:"Agent Keys To Load"=00000000'
+        if [ "$line" != "$replacement" ] || [ "$skip_lines" -gt 0 ]; then
+          changed=true
+        fi
+        printf '%s%s' "$replacement" "$line_ending" >>"$temporary_path"
+        ;;
+      *)
+        printf '%s%s' "$line" "$line_ending" >>"$temporary_path"
+        ;;
+    esac
+  done <"$ssh2_path"
+
+  if [ "$skip_lines" -gt 0 ]; then
+    rm -f "$temporary_path"
+    echo "The SSH agent key list is malformed: $ssh2_path" >&2
+    return 1
+  fi
+  if [ "$changed" = true ]; then
+    cp "$temporary_path" "$ssh2_path"
+  fi
+  rm -f "$temporary_path"
+}
+
 migrate_configuration() {
   source_path="$1"
   destination_path="$2"
@@ -162,6 +228,10 @@ migrate_configuration() {
   if ! /usr/bin/ditto "$source_path" "$staging_path"; then
     rm -rf "$staging_path"
     echo "Could not copy the existing SecureCRT configuration." >&2
+    return 1
+  fi
+  if ! disable_file_backed_ssh_keys "$staging_path"; then
+    rm -rf "$staging_path"
     return 1
   fi
   if ! validate_shareable_configuration "$staging_path"; then
@@ -260,6 +330,7 @@ EOF
 fi
 
 validate_shareable_configuration "$config_path"
+disable_file_backed_ssh_keys "$config_path"
 
 # Force the essential OneDrive placeholders to hydrate before configuration.
 head -c 1 "$config_path/Global.ini" >/dev/null
@@ -381,23 +452,30 @@ ssh_agent_status="$ssh_agent_socket"
 
 old_config="$(defaults read "$preferences_domain" "Config Path" 2>/dev/null || true)"
 old_personal="$(defaults read "$preferences_domain" "Personal Data Path" 2>/dev/null || true)"
-if [ "$old_config" != "$config_path" ] || [ "$old_personal" != "$personal_path" ]; then
+old_store_personal="$(defaults read "$preferences_domain" "Store Personal Data Separately" 2>/dev/null || true)"
+if [ "$old_config" != "$config_path" ] || [ "$old_personal" != "$personal_path" ] || \
+    [ "$old_store_personal" != "1" ]; then
   backup_dir="$HOME/Library/Application Support/VanDyke/SecureCRT/Setup Backups"
   mkdir -p "$backup_dir"
   backup_path="$backup_dir/configuration-paths-$(date -u +%Y%m%dT%H%M%SZ).txt"
   {
     printf 'Config Path=%s\n' "$old_config"
     printf 'Personal Data Path=%s\n' "$old_personal"
+    printf 'Store Personal Data Separately=%s\n' "$old_store_personal"
   } >"$backup_path"
   echo "Backed up the previous path settings to $backup_path"
 fi
 
 defaults write "$preferences_domain" "Config Path" -string "$config_path"
 defaults write "$preferences_domain" "Personal Data Path" -string "$personal_path"
+defaults write "$preferences_domain" "Store Personal Data Separately" -bool true
 
 configured_config="$(defaults read "$preferences_domain" "Config Path")"
 configured_personal="$(defaults read "$preferences_domain" "Personal Data Path")"
-if [ "$configured_config" != "$config_path" ] || [ "$configured_personal" != "$personal_path" ]; then
+configured_store_personal="$(defaults read "$preferences_domain" "Store Personal Data Separately")"
+if [ "$configured_config" != "$config_path" ] || \
+    [ "$configured_personal" != "$personal_path" ] || \
+    [ "$configured_store_personal" != "1" ]; then
   echo "SecureCRT preference verification failed." >&2
   exit 1
 fi
