@@ -33,6 +33,31 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-Module `
+            -Name PSScriptAnalyzer `
+            -RequiredVersion 1.25.0 `
+            -Scope CurrentUser `
+            -Repository PSGallery `
+            -Force
+
+      - name: Analyze PowerShell
+        shell: powershell
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+          $results = @(
+            Invoke-ScriptAnalyzer `
+              -Path . `
+              -Settings .\PSScriptAnalyzerSettings.psd1 `
+              -Recurse
+          )
+          if ($results.Count -gt 0) {
+            $results | Format-Table -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer reported $($results.Count) finding(s)."
+          }
+
       - name: Test Windows setup
         shell: powershell
         run: .\tests\test-securecrt-setup-windows.ps1

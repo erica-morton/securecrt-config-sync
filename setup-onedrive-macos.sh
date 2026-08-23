@@ -7,13 +7,17 @@ Usage: setup-onedrive-macos.sh [--config PATH] [--personal PATH]
                                  [--preferences-domain DOMAIN]
 
 Configures SecureCRT to use the synchronized OneDrive configuration while
-keeping credentials in a machine-local Personal Data folder.
+keeping credentials in a machine-local Personal Data folder. 1Password and
+its SSH agent are required for public-key authentication.
 EOF
 }
 
 config_path=""
 personal_path="$HOME/Library/Application Support/VanDyke/SecureCRT/Config.personal"
 preferences_domain="com.vandyke.SecureCRT"
+onepassword_app="${SECURECRT_SYNC_ONEPASSWORD_APP:-/Applications/1Password.app}"
+ssh_agent_socket="${SECURECRT_SYNC_ONEPASSWORD_SOCKET:-$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock}"
+launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -44,6 +48,58 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+required_helpers=(
+  setup-onedrive-macos.sh
+  setup-onedrive-windows.ps1
+  setup-onedrive-windows.cmd
+)
+for helper in "${required_helpers[@]}"; do
+  if [ ! -f "$script_dir/$helper" ]; then
+    echo "Required setup helper is missing: $script_dir/$helper" >&2
+    echo "Keep all three setup-onedrive-* files together, then retry." >&2
+    exit 1
+  fi
+done
+
+onepassword_agent_is_ready() {
+  [ -d "$onepassword_app" ] || return 1
+  [ -S "$ssh_agent_socket" ] || return 1
+
+  agent_probe_status=0
+  SSH_AUTH_SOCK="$ssh_agent_socket" /usr/bin/ssh-add -l >/dev/null 2>&1 || \
+    agent_probe_status=$?
+  [ "$agent_probe_status" -eq 0 ] || [ "$agent_probe_status" -eq 1 ]
+}
+
+wait_for_onepassword_agent() {
+  while ! onepassword_agent_is_ready; do
+    cat >&2 <<EOF
+
+1Password SSH agent setup is required before SecureCRT can be configured.
+
+1. Install or open 1Password and unlock it.
+2. Open Settings > Developer.
+3. Enable "Use the SSH Agent".
+
+Expected application: $onepassword_app
+Expected agent socket: $ssh_agent_socket
+EOF
+    if [ -d "$onepassword_app" ] && [ -S "$ssh_agent_socket" ]; then
+      echo "The agent socket exists, but it did not respond to an SSH agent probe." >&2
+    fi
+    if [ ! -t 0 ]; then
+      echo "Setup is non-interactive, so it cannot wait for 1Password. Run it from a terminal." >&2
+      exit 1
+    fi
+    printf '\nPress Enter after the 1Password SSH agent is enabled to test again (or Ctrl+C to cancel): ' >&2
+    IFS= read -r _
+  done
+  echo "1Password SSH agent is ready. Continuing setup."
+}
+
+wait_for_onepassword_agent
+
 running_clients() {
   pgrep -x SecureCRT >/dev/null 2>&1 || pgrep -x SecureFX >/dev/null 2>&1
 }
@@ -68,15 +124,68 @@ EOF
   fi
 fi
 
-script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+configuration_is_complete() {
+  candidate_path="$1"
+  [ -f "$candidate_path/Global.ini" ] && [ -d "$candidate_path/Sessions" ]
+}
+
+validate_shareable_configuration() {
+  candidate_path="$1"
+  if ! configuration_is_complete "$candidate_path"; then
+    echo "The configuration is incomplete: $candidate_path" >&2
+    return 1
+  fi
+
+  sensitive_config=false
+  while IFS= read -r -d '' session_file; do
+    if LC_ALL=C grep -Eq 'S:"[^"]*(Password|Passphrase)[^"]*"=.+$|D:"Session Password Saved"=00000001$' "$session_file"; then
+      if [ "$sensitive_config" = false ]; then
+        echo "Refusing to share a configuration that may contain saved credentials." >&2
+        echo "Move credentials into SecureCRT's Personal Data folder, then retry. Files:" >&2
+      fi
+      printf '  %s\n' "$session_file" >&2
+      sensitive_config=true
+    fi
+  done < <(find "$candidate_path/Sessions" -type f -name '*.ini' -print0)
+  if [ "$sensitive_config" = true ]; then
+    return 1
+  fi
+}
+
+migrate_configuration() {
+  source_path="$1"
+  destination_path="$2"
+  destination_parent="$(dirname "$destination_path")"
+  mkdir -p "$destination_parent"
+  staging_path="$(mktemp -d "$destination_parent/.Config.migration.XXXXXX")"
+
+  if ! /usr/bin/ditto "$source_path" "$staging_path"; then
+    rm -rf "$staging_path"
+    echo "Could not copy the existing SecureCRT configuration." >&2
+    return 1
+  fi
+  if ! validate_shareable_configuration "$staging_path"; then
+    rm -rf "$staging_path"
+    return 1
+  fi
+  if ! mv "$staging_path" "$destination_path"; then
+    rm -rf "$staging_path"
+    echo "Could not finish the shared SecureCRT configuration migration." >&2
+    return 1
+  fi
+
+  echo "Migrated the existing SecureCRT configuration:"
+  echo "  From: $source_path"
+  echo "  To:   $destination_path"
+}
 
 if [ -z "$config_path" ]; then
   candidates=()
-  if [ -f "$script_dir/Config/Global.ini" ] && [ -d "$script_dir/Config/Sessions" ]; then
+  if configuration_is_complete "$script_dir/Config"; then
     candidates+=("$script_dir/Config")
   fi
   for candidate in "$HOME"/Library/CloudStorage/OneDrive*/SecureCRT/Config; do
-    if [ -f "$candidate/Global.ini" ] && [ -d "$candidate/Sessions" ]; then
+    if configuration_is_complete "$candidate"; then
       duplicate=false
       for existing in "${candidates[@]:-}"; do
         if [ "$existing" = "$candidate" ]; then
@@ -89,38 +198,68 @@ if [ -z "$config_path" ]; then
     fi
   done
 
-  if [ "${#candidates[@]}" -eq 0 ]; then
-    echo "Could not find OneDrive/SecureCRT/Config. Use --config PATH." >&2
-    exit 1
-  fi
   if [ "${#candidates[@]}" -gt 1 ]; then
     echo "More than one SecureCRT configuration was found:" >&2
     printf '  %s\n' "${candidates[@]}" >&2
     echo "Re-run with --config PATH." >&2
     exit 1
   fi
-  config_path="${candidates[0]}"
-fi
-
-if [ ! -f "$config_path/Global.ini" ] || [ ! -d "$config_path/Sessions" ]; then
-  echo "The configuration is incomplete: $config_path" >&2
-  exit 1
-fi
-
-sensitive_config=false
-while IFS= read -r -d '' session_file; do
-  if LC_ALL=C grep -Eq 'S:"[^"]*(Password|Passphrase)[^"]*"=.+$|D:"Session Password Saved"=00000001$' "$session_file"; then
-    if [ "$sensitive_config" = false ]; then
-      echo "Refusing to share a configuration that may contain saved credentials." >&2
-      echo "Move credentials into SecureCRT's Personal Data folder, then retry. Files:" >&2
+  if [ "${#candidates[@]}" -eq 1 ]; then
+    config_path="${candidates[0]}"
+  else
+    one_drive_roots=()
+    for one_drive_root in "$HOME"/Library/CloudStorage/OneDrive*; do
+      if [ -d "$one_drive_root" ]; then
+        one_drive_roots+=("$one_drive_root")
+      fi
+    done
+    if [ "${#one_drive_roots[@]}" -eq 0 ]; then
+      echo "Could not find a OneDrive folder. Use --config PATH." >&2
+      exit 1
     fi
-    printf '  %s\n' "$session_file" >&2
-    sensitive_config=true
+    if [ "${#one_drive_roots[@]}" -gt 1 ]; then
+      echo "More than one OneDrive folder was found:" >&2
+      printf '  %s\n' "${one_drive_roots[@]}" >&2
+      echo "Re-run with --config PATH for the new shared Config folder." >&2
+      exit 1
+    fi
+    config_path="${one_drive_roots[0]}/SecureCRT/Config"
   fi
-done < <(find "$config_path/Sessions" -type f -name '*.ini' -print0)
-if [ "$sensitive_config" = true ]; then
-  exit 1
 fi
+
+if ! configuration_is_complete "$config_path"; then
+  if [ -e "$config_path" ]; then
+    echo "The target configuration exists but is incomplete: $config_path" >&2
+    echo "Move or repair that folder, then retry; setup will not overwrite it." >&2
+    exit 1
+  fi
+
+  configured_source="$(defaults read "$preferences_domain" "Config Path" 2>/dev/null || true)"
+  default_source="$HOME/Library/Application Support/VanDyke/SecureCRT/Config"
+  migration_source=""
+  if [ -n "$configured_source" ] && configuration_is_complete "$configured_source"; then
+    migration_source="$configured_source"
+  elif configuration_is_complete "$default_source"; then
+    migration_source="$default_source"
+  fi
+  if [ -z "$migration_source" ]; then
+    cat >&2 <<EOF
+The shared configuration does not exist yet, and no existing local SecureCRT
+configuration was found to migrate. Expected target: $config_path
+EOF
+    exit 1
+  fi
+
+  migration_source="$(cd "$migration_source" && pwd -P)"
+  if ! validate_shareable_configuration "$migration_source"; then
+    exit 1
+  fi
+  if ! migrate_configuration "$migration_source" "$config_path"; then
+    exit 1
+  fi
+fi
+
+validate_shareable_configuration "$config_path"
 
 # Force the essential OneDrive placeholders to hydrate before configuration.
 head -c 1 "$config_path/Global.ini" >/dev/null
@@ -183,6 +322,63 @@ sync_session_usernames() {
 
 synced_username_count="$(sync_session_usernames "$config_path/Sessions" "$personal_path/Sessions")"
 
+configure_gui_ssh_agent() {
+  socket_path="$1"
+  launch_agent_label="com.securecrt-config-sync.ssh-agent"
+  launch_agent_dir="$HOME/Library/LaunchAgents"
+  launch_agent_path="$launch_agent_dir/$launch_agent_label.plist"
+  mkdir -p "$launch_agent_dir"
+
+  escaped_socket="$(printf '%s' "$socket_path" | sed \
+    -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+  candidate="$(mktemp "${launch_agent_path}.tmp.XXXXXX")"
+  cat >"$candidate" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$launch_agent_label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/launchctl</string>
+    <string>setenv</string>
+    <string>SSH_AUTH_SOCK</string>
+    <string>$escaped_socket</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$candidate"
+
+  if [ ! -f "$launch_agent_path" ] || ! cmp -s "$candidate" "$launch_agent_path"; then
+    if [ -f "$launch_agent_path" ]; then
+      backup_dir="$HOME/Library/Application Support/VanDyke/SecureCRT/Setup Backups"
+      mkdir -p "$backup_dir"
+      cp "$launch_agent_path" \
+        "$backup_dir/ssh-agent-launch-agent-$(date -u +%Y%m%dT%H%M%SZ).plist"
+    fi
+    mv "$candidate" "$launch_agent_path"
+  else
+    rm "$candidate"
+  fi
+
+  launch_domain="gui/$(id -u)"
+  "$launchctl_bin" bootout "$launch_domain" "$launch_agent_path" >/dev/null 2>&1 || true
+  "$launchctl_bin" bootstrap "$launch_domain" "$launch_agent_path"
+  "$launchctl_bin" setenv SSH_AUTH_SOCK "$socket_path"
+  configured_socket="$($launchctl_bin getenv SSH_AUTH_SOCK)"
+  if [ "$configured_socket" != "$socket_path" ]; then
+    echo "Could not configure the GUI SSH agent socket." >&2
+    exit 1
+  fi
+}
+
+configure_gui_ssh_agent "$ssh_agent_socket"
+ssh_agent_status="$ssh_agent_socket"
+
 old_config="$(defaults read "$preferences_domain" "Config Path" 2>/dev/null || true)"
 old_personal="$(defaults read "$preferences_domain" "Personal Data Path" 2>/dev/null || true)"
 if [ "$old_config" != "$config_path" ] || [ "$old_personal" != "$personal_path" ]; then
@@ -209,7 +405,7 @@ fi
 # Put both platform setup helpers next to Config so they arrive through
 # OneDrive. If this script is already running there, no copy is needed.
 securecrt_root="$(dirname "$config_path")"
-for helper in setup-onedrive-macos.sh setup-onedrive-windows.ps1 setup-onedrive-windows.cmd; do
+for helper in "${required_helpers[@]}"; do
   source_path="$script_dir/$helper"
   target_path="$securecrt_root/$helper"
   if [ -f "$source_path" ] && [ "$source_path" != "$target_path" ]; then
@@ -225,6 +421,7 @@ SecureCRT OneDrive setup is complete.
   Local personal data:  $personal_path
   Saved sessions:        $session_count
   Synced usernames:      $synced_username_count
+  External SSH agent:    $ssh_agent_status
 
 The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd
