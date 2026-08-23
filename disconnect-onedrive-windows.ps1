@@ -152,7 +152,9 @@ if ($configCurrent -eq $state.ConfigPathInstalled) {
     $changes.Add('restore the previous SecureCRT configuration path')
     if (-not $DryRun) {
         if ($state.ConfigPathBeforePresent) {
-            New-Item -Path $registryPath -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $registryPath)) {
+                New-Item -Path $registryPath | Out-Null
+            }
             New-ItemProperty -LiteralPath $registryPath -Name 'Config Path' `
                 -PropertyType String -Value ([string]$state.ConfigPathBefore) `
                 -Force | Out-Null
@@ -169,7 +171,9 @@ if ($personalCurrent -eq $state.PersonalDataPathInstalled) {
     $changes.Add('restore the previous Personal Data path')
     if (-not $DryRun) {
         if ($state.PersonalDataPathBeforePresent) {
-            New-Item -Path $registryPath -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $registryPath)) {
+                New-Item -Path $registryPath | Out-Null
+            }
             New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' `
                 -PropertyType String -Value ([string]$state.PersonalDataPathBefore) `
                 -Force | Out-Null
@@ -186,7 +190,9 @@ if ($storeCurrent -eq $state.StorePersonalDataSeparatelyInstalled) {
     $changes.Add('restore the previous Personal Data separation setting')
     if (-not $DryRun) {
         if ($state.StorePersonalDataSeparatelyBeforePresent) {
-            New-Item -Path $registryPath -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $registryPath)) {
+                New-Item -Path $registryPath | Out-Null
+            }
             New-ItemProperty -LiteralPath $registryPath `
                 -Name 'Store Personal Data Separately' -PropertyType DWord `
                 -Value ([int]$state.StorePersonalDataSeparatelyBefore) `

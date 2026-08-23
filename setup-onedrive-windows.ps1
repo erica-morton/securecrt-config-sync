@@ -736,7 +736,9 @@ if ($oldConfigPath -ne $ConfigPath -or
     Write-Host "Backed up the previous path settings to $backupPath"
 }
 
-New-Item -Path $registryPath -Force | Out-Null
+if (-not (Test-Path -LiteralPath $registryPath)) {
+    New-Item -Path $registryPath | Out-Null
+}
 New-ItemProperty -LiteralPath $registryPath -Name 'Config Path' -PropertyType String `
     -Value $ConfigPath -Force | Out-Null
 New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' -PropertyType String `

@@ -132,6 +132,8 @@ try {
         -PropertyType String -Value 'C:\previous\personal' -Force | Out-Null
     New-ItemProperty -LiteralPath $registryPath -Name 'Store Personal Data Separately' `
         -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $registryPath -Name 'Unrelated Setting' `
+        -PropertyType String -Value 'preserve-me' -Force | Out-Null
 
     $firstOutput = & $installer `
         -ConfigPath $configPath `
@@ -151,6 +153,9 @@ try {
             -Name 'Store Personal Data Separately') `
         'Store Personal Data Separately'
     Assert-FileBackedSshKeysDisabled -ConfigurationPath $configPath
+    Assert-Equal 'preserve-me' `
+        (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Unrelated Setting') `
+        'unrelated registry setting after setup'
     if (-not (Test-Path -LiteralPath $personalPath -PathType Container)) {
         throw 'The Personal Data folder was not created.'
     }
@@ -240,6 +245,9 @@ try {
         'restored Personal Data separation setting'
     Assert-Equal 'previous-agent' $env:VANDYKE_SSH_AUTH_SOCK `
         'restored external-agent environment value'
+    Assert-Equal 'preserve-me' `
+        (Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Unrelated Setting') `
+        'unrelated registry setting after disconnect'
     $setupState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     Assert-Equal $false $setupState.Active 'inactive setup state'
     if (-not (Test-Path -LiteralPath $configPath -PathType Container) -or
