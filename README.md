@@ -26,12 +26,14 @@ It is not affiliated with or endorsed by VanDyke Software, Inc.
   try to open another computer's private-key paths;
 - pins the SecureCRT tree for offline use on Windows;
 - backs up previous path settings before changing them;
+- records a machine-local rollback manifest without storing credentials;
 - publishes all platform helpers next to the shared `Config` folder; and
 - verifies its changes and supports safe, idempotent reruns.
 
 ## Start or join a shared configuration
 
-Keep the three `setup-onedrive-*` files together. A Git checkout is not
+Keep the three `setup-onedrive-*` and three `disconnect-onedrive-*` files
+together. A Git checkout is not
 required; they can be obtained by downloading and extracting this repository.
 
 If `OneDrive/SecureCRT/Config` already exists, the helper joins that shared
@@ -84,12 +86,12 @@ agent socket and creates a user
 LaunchAgent so SecureCRT opened from Finder or the Dock inherits that socket
 after every login. If 1Password or its agent is unavailable, interactive setup
 shows the required steps, waits, retests, and continues when the agent is
-ready. It also copies itself and the Windows helpers into the OneDrive
-`SecureCRT` folder.
+ready. It also publishes all macOS and Windows setup and disconnect helpers
+into the OneDrive `SecureCRT` folder.
 
 ## Windows setup
 
-On the first Windows computer, extract the three helpers together and
+On the first Windows computer, extract all six helpers together and
 double-click the CMD file. On later computers, open the synchronized
 `OneDrive\SecureCRT` folder and double-click the same file:
 
@@ -112,15 +114,53 @@ For an explicit shared configuration path, run PowerShell:
   -ConfigPath 'C:\path\to\OneDrive\SecureCRT\Config'
 ```
 
-The Windows helper can originate or join the share and publishes the Mac and
-Windows helpers into it. It requires 1Password to be running with **Settings >
-Developer > Use the SSH Agent** enabled. It verifies that the 1Password agent owns the
+The Windows helper can originate or join the share and publishes all macOS and
+Windows setup and disconnect helpers into it. It requires 1Password to be
+running with **Settings > Developer > Use the SSH Agent** enabled. It verifies
+that the 1Password agent owns the
 standard `\\.\pipe\openssh-ssh-agent` pipe, then sets SecureCRT's
 `VANDYKE_SSH_AUTH_SOCK` user environment variable to that pipe. If the Windows
 OpenSSH Authentication Agent service is running, setup explains how to stop
 and disable it so 1Password can own the pipe. Interactive setup waits while
 those steps are completed, retests the agent, and then continues. A
 non-interactive run fails fast instead of hanging.
+
+## Disconnect or roll back one computer
+
+Disconnect restores only the machine-local settings captured by setup. It
+does not uninstall SecureCRT, modify or delete the shared OneDrive `Config`
+tree, remove 1Password, or delete the local Personal Data folder.
+
+Preview the macOS rollback, then apply it:
+
+```bash
+bash ./disconnect-onedrive-macos.sh --dry-run
+bash ./disconnect-onedrive-macos.sh
+```
+
+On Windows, double-click `disconnect-onedrive-windows.cmd`, or preview it from
+PowerShell:
+
+```powershell
+.\disconnect-onedrive-windows.ps1 -DryRun
+```
+
+Setup records the values it replaced and the values it installed. Disconnect
+restores a setting only when it still has the installed value; a setting
+changed later by the user or another tool is left untouched and reported.
+Successful disconnects are idempotent. Rerunning the current setup after an
+older installation creates rollback state from compatible setup backup
+history, with a retained local SecureCRT configuration as a safe fallback.
+
+The default state manifests are machine-local:
+
+```text
+macOS:
+~/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist
+
+Windows:
+%LOCALAPPDATA%\VanDyke\SecureCRT-Setup-State\onedrive-sync.json
+```
 
 ## Daily use
 
@@ -150,7 +190,8 @@ path discovery, saved-credential rejection, backup creation, preferences and
 registry writes, helper deployment, validation failures, CMD argument
 forwarding, session counts, first-machine migrations, pre-copy credential
 safety, Personal Data enablement, removal of file-backed SSH keys,
-external-agent settings, and idempotent reruns.
+external-agent settings, rollback-state creation, disconnect dry runs,
+ownership guards, exact restoration, retained data, and idempotent reruns.
 
 Hosted CI cannot authenticate to a real OneDrive account or launch a licensed
 SecureCRT installation. OneDrive hydration and the first actual SecureCRT

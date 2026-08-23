@@ -10,6 +10,9 @@ param(
     [string]$RegistryPath = 'HKCU:\Software\VanDyke\SecureCRT',
 
     [Parameter()]
+    [string]$StatePath,
+
+    [Parameter()]
     [switch]$SkipOneDrivePin
 )
 
@@ -21,14 +24,17 @@ $AgentEnvironmentTarget = if ($testMode) { 'Process' } else { 'User' }
 $RequiredHelpers = @(
     'setup-onedrive-macos.sh',
     'setup-onedrive-windows.ps1',
-    'setup-onedrive-windows.cmd'
+    'setup-onedrive-windows.cmd',
+    'disconnect-onedrive-macos.sh',
+    'disconnect-onedrive-windows.ps1',
+    'disconnect-onedrive-windows.cmd'
 )
 foreach ($helper in $RequiredHelpers) {
     $helperPath = Join-Path $PSScriptRoot $helper
     if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
         throw @"
 Required setup helper is missing: $helperPath
-Keep all three setup-onedrive-* files together, then retry.
+Keep all setup-onedrive-* and disconnect-onedrive-* files together, then retry.
 "@
     }
 }
@@ -258,6 +264,24 @@ function Get-OptionalRegistryValue {
         return $null
     }
     return $property.Value
+}
+
+function Save-SetupState {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$State
+    )
+
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $temporaryPath = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $State | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Assert-ShareableConfiguration {
@@ -579,14 +603,126 @@ if (Test-Path -LiteralPath $registryPath) {
         -Path $registryPath -Name 'Store Personal Data Separately'
 }
 
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    throw 'LOCALAPPDATA is not set, so setup state cannot be stored.'
+}
+$backupDirectory = Join-Path $env:LOCALAPPDATA 'VanDyke\SecureCRT-Setup-Backups'
+if ([string]::IsNullOrWhiteSpace($StatePath)) {
+    $StatePath = Join-Path $env:LOCALAPPDATA `
+        'VanDyke\SecureCRT-Setup-State\onedrive-sync.json'
+}
+$StatePath = [IO.Path]::GetFullPath($StatePath)
+
+$setupState = $null
+if (Test-Path -LiteralPath $StatePath -PathType Leaf) {
+    $setupState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    if ($setupState.Version -ne 1) {
+        throw "Unsupported SecureCRT setup state version in $StatePath"
+    }
+}
+
+if ($null -eq $setupState -or -not $setupState.Active) {
+    $beforeConfigPath = $oldConfigPath
+    $beforePersonalDataPath = $oldPersonalDataPath
+    $beforeStorePersonalDataSeparately = $oldStorePersonalDataSeparately
+    $beforeAgentPipe = $oldAgentPipe
+
+    $looksLikeLegacyInstall = $oldConfigPath -eq $ConfigPath -and
+        $oldPersonalDataPath -eq $PersonalDataPath -and
+        $oldStorePersonalDataSeparately -eq 1 -and
+        $oldAgentPipe -eq $AgentPipe
+    if ($looksLikeLegacyInstall -and (Test-Path -LiteralPath $backupDirectory)) {
+        $legacyState = $null
+        $newestMatchingLegacyState = $null
+        foreach ($legacyBackup in @(
+            Get-ChildItem -LiteralPath $backupDirectory `
+                -Filter 'configuration-paths-*.json' -File |
+                Sort-Object LastWriteTimeUtc -Descending
+        )) {
+            $candidateLegacyState = Get-Content -LiteralPath $legacyBackup.FullName `
+                -Raw | ConvertFrom-Json
+            if ($candidateLegacyState.RegistryPath -eq $registryPath) {
+                if ($null -eq $newestMatchingLegacyState) {
+                    $newestMatchingLegacyState = $candidateLegacyState
+                }
+                if ($candidateLegacyState.ConfigPath -ne $ConfigPath) {
+                    $legacyState = $candidateLegacyState
+                    break
+                }
+            }
+        }
+        if ($null -eq $legacyState) {
+            $legacyState = $newestMatchingLegacyState
+        }
+        if ($null -ne $legacyState) {
+            $beforeConfigPath = $legacyState.ConfigPath
+            $beforePersonalDataPath = $legacyState.PersonalDataPath
+            $storeProperty = $legacyState.PSObject.Properties[
+                'StorePersonalDataSeparately'
+            ]
+            $beforeStorePersonalDataSeparately = if ($null -eq $storeProperty) {
+                $null
+            } else {
+                $storeProperty.Value
+            }
+            $beforeAgentPipe = $legacyState.VanDykeSshAuthSock
+        }
+    }
+    if ($looksLikeLegacyInstall -and $beforeConfigPath -eq $ConfigPath -and
+        -not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        foreach ($localCandidate in @(
+            (Join-Path $env:APPDATA 'VanDyke\SecureCRT\Config'),
+            (Join-Path $env:APPDATA 'VanDyke\Config')
+        )) {
+            if ((Test-CompleteConfiguration -Path $localCandidate) -and
+                $localCandidate -ne $ConfigPath) {
+                $beforeConfigPath = (Get-Item -LiteralPath $localCandidate).FullName
+                $beforePersonalDataPath = $null
+                $beforeStorePersonalDataSeparately = $null
+                $beforeAgentPipe = $null
+                break
+            }
+        }
+    }
+
+    $now = (Get-Date).ToUniversalTime().ToString('o')
+    $setupState = [ordered]@{
+        Version = 1
+        Active = $true
+        CreatedAt = $now
+        UpdatedAt = $now
+        RegistryPath = $registryPath
+        AgentEnvironmentTarget = $AgentEnvironmentTarget
+        ConfigPathBeforePresent = $null -ne $beforeConfigPath
+        ConfigPathBefore = $beforeConfigPath
+        ConfigPathInstalled = $ConfigPath
+        PersonalDataPathBeforePresent = $null -ne $beforePersonalDataPath
+        PersonalDataPathBefore = $beforePersonalDataPath
+        PersonalDataPathInstalled = $PersonalDataPath
+        StorePersonalDataSeparatelyBeforePresent = `
+            $null -ne $beforeStorePersonalDataSeparately
+        StorePersonalDataSeparatelyBefore = $beforeStorePersonalDataSeparately
+        StorePersonalDataSeparatelyInstalled = 1
+        VanDykeSshAuthSockBeforePresent = $null -ne $beforeAgentPipe
+        VanDykeSshAuthSockBefore = $beforeAgentPipe
+        VanDykeSshAuthSockInstalled = $AgentPipe
+    }
+} else {
+    $setupState.Active = $true
+    $setupState.UpdatedAt = (Get-Date).ToUniversalTime().ToString('o')
+    $setupState.RegistryPath = $registryPath
+    $setupState.AgentEnvironmentTarget = $AgentEnvironmentTarget
+    $setupState.ConfigPathInstalled = $ConfigPath
+    $setupState.PersonalDataPathInstalled = $PersonalDataPath
+    $setupState.StorePersonalDataSeparatelyInstalled = 1
+    $setupState.VanDykeSshAuthSockInstalled = $AgentPipe
+}
+Save-SetupState -Path $StatePath -State $setupState
+
 if ($oldConfigPath -ne $ConfigPath -or
     $oldPersonalDataPath -ne $PersonalDataPath -or
     $oldStorePersonalDataSeparately -ne 1 -or
     $oldAgentPipe -ne $AgentPipe) {
-    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        throw 'LOCALAPPDATA is not set, so the previous settings cannot be backed up.'
-    }
-    $backupDirectory = Join-Path $env:LOCALAPPDATA 'VanDyke\SecureCRT-Setup-Backups'
     New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
     $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
     $backupPath = Join-Path $backupDirectory "configuration-paths-$timestamp.json"
@@ -600,7 +736,9 @@ if ($oldConfigPath -ne $ConfigPath -or
     Write-Host "Backed up the previous path settings to $backupPath"
 }
 
-New-Item -Path $registryPath -Force | Out-Null
+if (-not (Test-Path -LiteralPath $registryPath)) {
+    New-Item -Path $registryPath | Out-Null
+}
 New-ItemProperty -LiteralPath $registryPath -Name 'Config Path' -PropertyType String `
     -Value $ConfigPath -Force | Out-Null
 New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' -PropertyType String `
@@ -643,5 +781,6 @@ Write-Host "  Local personal data:  $PersonalDataPath"
 Write-Host "  Saved sessions:        $sessionCount"
 Write-Host "  Synced usernames:      $syncedUsernameCount"
 Write-Host "  External SSH agent:    $sshAgentStatus"
+Write-Host "  Disconnect state:      $StatePath"
 Write-Host ''
 Write-Host 'Launch SecureCRT normally. No administrator access or Git checkout is required.'
