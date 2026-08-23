@@ -1,0 +1,38 @@
+name: Test SecureCRT config sync
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS integration
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate shell scripts
+        run: |
+          bash -n setup-onedrive-macos.sh
+          bash -n tests/test-securecrt-setup-macos.sh
+
+      - name: Test macOS setup
+        run: tests/test-securecrt-setup-macos.sh
+
+  windows:
+    name: Windows integration
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Test Windows setup
+        shell: powershell
+        run: .\tests\test-securecrt-setup-windows.ps1
