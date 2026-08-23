@@ -62,7 +62,8 @@ mkdir -p "$session_group/VMs" "$test_root/home"
 printf 'test global configuration\n' >"$config_path/Global.ini"
 write_file_backed_ssh2_config "$config_path/SSH2.ini"
 printf 'folder metadata\n' >"$session_group/__FolderData__.ini"
-printf 'S:"Hostname"=host-one.example\r\nS:"Username"=erica\r\n' >"$session_group/host-one.ini"
+printf 'S:"Hostname"=host-one.example\r\nS:"Username"=erica\r\nS:"Password V2"=\r\n' \
+  >"$session_group/host-one.ini"
 printf 'S:"Hostname"=host-two.example\r\nS:"Username"=root\r\n' >"$session_group/VMs/host-two.ini"
 mkdir -p "$personal_path/Sessions/Example Group"
 printf '\357\273\277S:"Password V2"=preserve-me\r\nS:"Username"=wrong-user\r\n' \

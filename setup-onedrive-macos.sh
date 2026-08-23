@@ -138,7 +138,17 @@ validate_shareable_configuration() {
 
   sensitive_config=false
   while IFS= read -r -d '' session_file; do
-    if LC_ALL=C grep -Eq 'S:"[^"]*(Password|Passphrase)[^"]*"=.+$|D:"Session Password Saved"=00000001$' "$session_file"; then
+    if LC_ALL=C awk '
+      {
+        sub(/\r$/, "")
+        if ($0 ~ /^S:"[^"]*(Password|Passphrase)[^"]*"=.+$/ ||
+            $0 == "D:\"Session Password Saved\"=00000001") {
+          found = 1
+          exit
+        }
+      }
+      END { exit found ? 0 : 1 }
+    ' "$session_file"; then
       if [ "$sensitive_config" = false ]; then
         echo "Refusing to share a configuration that may contain saved credentials." >&2
         echo "Move credentials into SecureCRT's Personal Data folder, then retry. Files:" >&2
