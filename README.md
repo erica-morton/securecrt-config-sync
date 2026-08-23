@@ -17,11 +17,13 @@ It is not affiliated with or endorsed by VanDyke Software, Inc.
 - asks SecureCRT and SecureFX to quit cleanly and never force-terminates them;
 - refuses configurations whose session files appear to contain saved
   passwords or passphrases;
-- creates a machine-local Personal Data folder;
+- creates a machine-local Personal Data folder and explicitly enables it;
 - initializes its session usernames from the shared connection metadata;
 - configures SecureCRT's shared and personal paths on macOS or Windows;
 - connects SecureCRT to the 1Password/OpenSSH agent without copying private
   keys into its configuration;
+- removes global identity-file and key-preload entries so SecureCRT does not
+  try to open another computer's private-key paths;
 - pins the SecureCRT tree for offline use on Windows;
 - backs up previous path settings before changing them;
 - publishes all platform helpers next to the shared `Config` folder; and
@@ -147,7 +149,8 @@ PSScriptAnalyzer to every PowerShell file. Tests cover
 path discovery, saved-credential rejection, backup creation, preferences and
 registry writes, helper deployment, validation failures, CMD argument
 forwarding, session counts, first-machine migrations, pre-copy credential
-safety, external-agent settings, and idempotent reruns.
+safety, Personal Data enablement, removal of file-backed SSH keys,
+external-agent settings, and idempotent reruns.
 
 Hosted CI cannot authenticate to a real OneDrive account or launch a licensed
 SecureCRT installation. OneDrive hydration and the first actual SecureCRT

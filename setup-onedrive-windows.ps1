@@ -180,6 +180,69 @@ function Test-CompleteConfiguration {
     )
 }
 
+function Disable-FileBackedSshKey {
+    param([Parameter(Mandatory)][string]$ConfigurationPath)
+
+    $ssh2Path = Join-Path $ConfigurationPath 'SSH2.ini'
+    if (-not (Test-Path -LiteralPath $ssh2Path -PathType Leaf)) {
+        return
+    }
+
+    $content = [IO.File]::ReadAllText($ssh2Path)
+    $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $hasTrailingNewline = $content.EndsWith("`n")
+    $lines = [Regex]::Split($content, '\r?\n')
+    if ($hasTrailingNewline -and $lines.Count -gt 0 -and $lines[-1] -eq '') {
+        $lines = $lines[0..($lines.Count - 2)]
+    }
+
+    $updatedLines = [System.Collections.Generic.List[string]]::new()
+    $changed = $false
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line -match '^S:"Identity Filename V2"=') {
+            $replacement = 'S:"Identity Filename V2"='
+            $updatedLines.Add($replacement)
+            $changed = $changed -or $line -ne $replacement
+            continue
+        }
+        if ($line -match '^D:"Add Private Keys To Agent"=') {
+            $replacement = 'D:"Add Private Keys To Agent"=00000000'
+            $updatedLines.Add($replacement)
+            $changed = $changed -or $line -ne $replacement
+            continue
+        }
+        if ($line -match '^Z:"Agent Keys To Load"=([0-9A-Fa-f]{8})$') {
+            $keyCount = [Convert]::ToInt32($Matches[1], 16)
+            if ($index + $keyCount -ge $lines.Count) {
+                throw "The SSH agent key list is malformed: $ssh2Path"
+            }
+            $replacement = 'Z:"Agent Keys To Load"=00000000'
+            $updatedLines.Add($replacement)
+            $changed = $changed -or $line -ne $replacement -or $keyCount -gt 0
+            $index += $keyCount
+            continue
+        }
+        $updatedLines.Add($line)
+    }
+
+    if (-not $changed) {
+        return
+    }
+
+    $updatedContent = $updatedLines -join $newline
+    if ($hasTrailingNewline) {
+        $updatedContent += $newline
+    }
+    $temporaryPath = "$ssh2Path.securecrt-config-sync.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporaryPath, $updatedContent, [Text.UTF8Encoding]::new($true))
+        Move-Item -LiteralPath $temporaryPath -Destination $ssh2Path -Force
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-OptionalRegistryValue {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -240,6 +303,7 @@ function Copy-ConfigurationAtomically {
     try {
         Get-ChildItem -LiteralPath $Source -Force |
             Copy-Item -Destination $stagingPath -Recurse -Force
+        Disable-FileBackedSshKey -ConfigurationPath $stagingPath
         Assert-ShareableConfiguration -Path $stagingPath
         Move-Item -LiteralPath $stagingPath -Destination $Destination
     } catch {
@@ -451,6 +515,7 @@ $ConfigPath = Get-NormalizedDirectory -Path $ConfigPath
 $globalIni = Join-Path $ConfigPath 'Global.ini'
 $sessionsPath = Join-Path $ConfigPath 'Sessions'
 Assert-ShareableConfiguration -Path $ConfigPath
+Disable-FileBackedSshKey -ConfigurationPath $ConfigPath
 
 $sessionFiles = @(
     Get-ChildItem -LiteralPath $sessionsPath -File -Filter '*.ini' -Recurse
@@ -496,6 +561,7 @@ $oldAgentPipe = [Environment]::GetEnvironmentVariable(
 
 $oldConfigPath = $null
 $oldPersonalDataPath = $null
+$oldStorePersonalDataSeparately = $null
 if (Test-Path -LiteralPath $registryPath) {
     try {
         $oldConfigPath = Get-ItemPropertyValue -LiteralPath $registryPath `
@@ -509,10 +575,13 @@ if (Test-Path -LiteralPath $registryPath) {
     } catch [System.Management.Automation.PSArgumentException] {
         $oldPersonalDataPath = $null
     }
+    $oldStorePersonalDataSeparately = Get-OptionalRegistryValue `
+        -Path $registryPath -Name 'Store Personal Data Separately'
 }
 
 if ($oldConfigPath -ne $ConfigPath -or
     $oldPersonalDataPath -ne $PersonalDataPath -or
+    $oldStorePersonalDataSeparately -ne 1 -or
     $oldAgentPipe -ne $AgentPipe) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         throw 'LOCALAPPDATA is not set, so the previous settings cannot be backed up.'
@@ -525,6 +594,7 @@ if ($oldConfigPath -ne $ConfigPath -or
         RegistryPath = $registryPath
         ConfigPath = $oldConfigPath
         PersonalDataPath = $oldPersonalDataPath
+        StorePersonalDataSeparately = $oldStorePersonalDataSeparately
         VanDykeSshAuthSock = $oldAgentPipe
     } | ConvertTo-Json | Set-Content -LiteralPath $backupPath -Encoding UTF8
     Write-Host "Backed up the previous path settings to $backupPath"
@@ -535,10 +605,16 @@ New-ItemProperty -LiteralPath $registryPath -Name 'Config Path' -PropertyType St
     -Value $ConfigPath -Force | Out-Null
 New-ItemProperty -LiteralPath $registryPath -Name 'Personal Data Path' -PropertyType String `
     -Value $PersonalDataPath -Force | Out-Null
+New-ItemProperty -LiteralPath $registryPath -Name 'Store Personal Data Separately' `
+    -PropertyType DWord -Value 1 -Force | Out-Null
 
 $configuredConfig = Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Config Path'
 $configuredPersonal = Get-ItemPropertyValue -LiteralPath $registryPath -Name 'Personal Data Path'
-if ($configuredConfig -ne $ConfigPath -or $configuredPersonal -ne $PersonalDataPath) {
+$configuredStorePersonalDataSeparately = Get-ItemPropertyValue -LiteralPath $registryPath `
+    -Name 'Store Personal Data Separately'
+if ($configuredConfig -ne $ConfigPath -or
+    $configuredPersonal -ne $PersonalDataPath -or
+    $configuredStorePersonalDataSeparately -ne 1) {
     throw 'SecureCRT registry verification failed.'
 }
 
