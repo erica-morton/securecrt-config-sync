@@ -17,6 +17,7 @@ cleanup() {
   defaults delete "$migration_domain" >/dev/null 2>&1 || true
   defaults delete "$unsafe_migration_domain" >/dev/null 2>&1 || true
   defaults delete "$legacy_domain" >/dev/null 2>&1 || true
+  defaults delete "io.github.securecrtconfigsync.probe.test.$$" >/dev/null 2>&1 || true
   if [ -n "$agent_pid" ]; then
     kill "$agent_pid" >/dev/null 2>&1 || true
   fi
@@ -96,6 +97,8 @@ fi
 agent_socket="$test_root/1password-agent.sock"
 onepassword_app="$test_root/1Password.app"
 launchctl_state="$test_root/launchctl-ssh-auth-sock"
+launchctl_disabled="$test_root/launchctl-disabled"
+launchctl_enabled="$test_root/launchctl-enabled"
 mock_launchctl="$test_root/mock-launchctl.sh"
 mkdir -p "$onepassword_app"
 eval "$(/usr/bin/ssh-agent -a "$agent_socket" -s)" >/dev/null
@@ -108,10 +111,29 @@ printf '%s\n' \
   '  unsetenv) : >"$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  getenv) [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_STATE" ] || cat "$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  bootout|bootstrap) ;;' \
+  '  disable) printf "%s\\n" "$2" >>"$SECURECRT_SYNC_LAUNCHCTL_DISABLED" ;;' \
+  '  enable) printf "%s\\n" "$2" >>"$SECURECRT_SYNC_LAUNCHCTL_ENABLED" ;;' \
+  '  print-disabled)' \
+  '    [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_DISABLED" ] || \' \
+  '      while IFS= read -r entry; do' \
+  '        printf "\\t\\t\\"%s\\" => disabled\\n" "${entry##*/}"' \
+  '      done <"$SECURECRT_SYNC_LAUNCHCTL_DISABLED"' \
+  '    ;;' \
   '  *) exit 1 ;;' \
   'esac' >"$mock_launchctl"
 chmod 0755 "$mock_launchctl"
 printf '%s' '/previous/gui-agent.sock' >"$launchctl_state"
+
+# Stands in for Launch Services: runs the probe bundle with whatever
+# SSH_AUTH_SOCK macOS would have injected into a GUI application.
+mock_open="$test_root/mock-open.sh"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  'probe_app="$2"' \
+  'SSH_AUTH_SOCK="${SECURECRT_SYNC_FAKE_GUI_SOCK:-}" \' \
+  '  "$probe_app/Contents/MacOS/SecureCRTSyncAgentProbe"' >"$mock_open"
+chmod 0755 "$mock_open"
 
 previous_launch_agent='previous launch agent content'
 launch_agent="$test_root/home/Library/LaunchAgents/com.securecrt-config-sync.ssh-agent.plist"
@@ -128,6 +150,9 @@ first_output="$(
   SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
   SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
   SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
   "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
@@ -147,6 +172,21 @@ printf '%s\n' "$first_output" | grep -Eq 'Synced usernames: +2'
 printf '%s\n' "$first_output" | grep -Fq "External SSH agent:    $agent_socket"
 assert_equal "$agent_socket" "$(cat "$launchctl_state")" "GUI SSH agent socket"
 grep -Fq "$agent_socket" "$launch_agent"
+
+# macOS overrides SSH_AUTH_SOCK for GUI applications through the built-in SSH
+# agent's SecureSocketWithKey export, so setup must disable that job.
+grep -Fq "gui/$(id -u)/com.openssh.ssh-agent" "$launchctl_disabled"
+setup_state_first="$test_root/home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+assert_equal "2" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :Version' "$setup_state_first")" \
+  "setup state version"
+assert_equal "false" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :SystemSshAgentDisabledBefore' "$setup_state_first")" \
+  "recorded prior built-in SSH agent state"
+assert_equal "true" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :SystemSshAgentDisabledBySetup' "$setup_state_first")" \
+  "recorded built-in SSH agent disable"
+
 grep -Fq 'S:"Username"=erica' "$personal_path/Sessions/Example Group/host-one.ini"
 grep -Fq 'S:"Password V2"=preserve-me' "$personal_path/Sessions/Example Group/host-one.ini"
 grep -Fq 'S:"Username"=root' "$personal_path/Sessions/Example Group/VMs/host-two.ini"
@@ -175,6 +215,9 @@ SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
 SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
 SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
 SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+SECURECRT_SYNC_OPEN="$mock_open" \
 "$installer" \
   --config "$config_path" \
   --personal "$personal_path" \
@@ -186,6 +229,9 @@ dry_run_output="$(
   HOME="$test_root/home" \
   SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
   SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
   bash "$disconnect" --dry-run
 )"
 printf '%s\n' "$dry_run_output" | grep -Fq 'SecureCRT disconnect dry run:'
@@ -200,6 +246,9 @@ disconnect_output="$(
   HOME="$test_root/home" \
   SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
   SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
   bash "$disconnect"
 )"
 printf '%s\n' "$disconnect_output" | grep -Fq 'SecureCRT disconnected:'
@@ -215,6 +264,8 @@ assert_equal "0" \
   "restored Personal Data separation setting"
 assert_equal "/previous/gui-agent.sock" "$(cat "$launchctl_state")" \
   "restored GUI SSH agent socket"
+grep -Fq "gui/$(id -u)/com.openssh.ssh-agent" "$launchctl_enabled"
+printf '%s\n' "$disconnect_output" | grep -Fq 're-enable the built-in macOS SSH agent'
 assert_equal "$previous_launch_agent" "$(cat "$launch_agent")" \
   "restored LaunchAgent"
 assert_equal "false" "$(/usr/libexec/PlistBuddy -c 'Print :Active' "$setup_state")" \
@@ -226,6 +277,9 @@ second_disconnect_output="$(
   HOME="$test_root/home" \
   SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
   SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
   bash "$disconnect"
 )"
 printf '%s\n' "$second_disconnect_output" | grep -Fq 'already disconnected'
@@ -248,6 +302,9 @@ SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
 SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
 SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
 SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
+SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+SECURECRT_SYNC_OPEN="$mock_open" \
 bash "$installer" \
   --config "$config_path" \
   --personal "$legacy_personal" \
@@ -263,6 +320,9 @@ assert_equal "false" \
 HOME="$legacy_home" \
 SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
 SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
+SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+SECURECRT_SYNC_OPEN="$mock_open" \
 bash "$disconnect" >/dev/null
 assert_equal "$legacy_local_config" "$(defaults read "$legacy_domain" "Config Path")" \
   "legacy restored Config Path"
@@ -285,6 +345,9 @@ migration_output="$(
   SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
   SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
   SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
   bash "$installer" \
     --personal "$migration_personal" \
     --preferences-domain "$migration_domain"
@@ -317,6 +380,9 @@ if HOME="$unsafe_migration_home" \
     SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
     SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
     SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
     bash "$installer" \
     --personal "$unsafe_migration_personal" \
     --preferences-domain "$unsafe_migration_domain" >/dev/null 2>&1; then
@@ -335,6 +401,9 @@ if HOME="$test_root/home" \
     SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
     SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
     SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
     "$installer" \
     --config "$partial_config" \
     --personal "$personal_path" \
@@ -349,6 +418,9 @@ if HOME="$test_root/home" \
     SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
     SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
     SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
     "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
@@ -357,5 +429,43 @@ if HOME="$test_root/home" \
   exit 1
 fi
 rm "$session_group/unsafe.ini"
+# The failure this guards against: "launchctl getenv" reports the socket that
+# setup wrote while macOS still hands GUI applications its own built-in agent,
+# so setup used to report success on a machine where SecureCRT could not
+# authenticate. Verification now probes what Launch Services actually injects.
+probe_home="$test_root/probe-home"
+probe_domain="io.github.securecrtconfigsync.probe.test.$$"
+probe_personal="$test_root/probe-personal"
+mkdir -p "$probe_home"
+
+run_probe_setup() {
+  HOME="$probe_home" \
+  SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+  SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_FAKE_GUI_SOCK="$1" \
+  "$installer" \
+    --config "$config_path" \
+    --personal "$probe_personal" \
+    --preferences-domain "$probe_domain"
+}
+
+overridden_output="$(run_probe_setup "/var/run/com.apple.launchd.test/Listeners")"
+if ! printf '%s\n' "$overridden_output" | grep -Fq 'Log out and back in before starting SecureCRT.'; then
+  echo "Setup did not report that macOS is still overriding SSH_AUTH_SOCK." >&2
+  exit 1
+fi
+
+healthy_output="$(run_probe_setup "$agent_socket")"
+if printf '%s\n' "$healthy_output" | grep -Fq 'Log out and back in before starting SecureCRT.'; then
+  echo "Setup asked for a re-login even though the GUI agent socket was correct." >&2
+  exit 1
+fi
+defaults delete "$probe_domain" >/dev/null 2>&1 || true
+
 
 echo "macOS SecureCRT setup integration test passed."
