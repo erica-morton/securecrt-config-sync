@@ -120,6 +120,20 @@ not, prints the elevated command to run:
 sudo launchctl disable gui/$(id -u)/com.openssh.ssh-agent
 ```
 
+### Diagnosing password prompts
+
+When SecureCRT prompts for a password instead of using the agent, run:
+
+```bash
+bash ./diagnose-ssh-agent-macos.sh
+```
+
+It checks each link in turn - the 1Password agent, whether the built-in agent
+is disabled in the override database, whether it is still loaded in this login
+session, the sync LaunchAgent, the `SSH_AUTH_SOCK` a Launch Services
+application actually inherits, and the value the running SecureCRT holds - then
+prints a diagnosis and the command to fix it. It changes nothing.
+
 ## Windows setup
 
 On the first Windows computer, extract all six helpers together and
