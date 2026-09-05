@@ -19,6 +19,9 @@ state_path=""
 onepassword_app="${SECURECRT_SYNC_ONEPASSWORD_APP:-/Applications/1Password.app}"
 ssh_agent_socket="${SECURECRT_SYNC_ONEPASSWORD_SOCKET:-$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock}"
 launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
+system_ssh_agent_label="${SECURECRT_SYNC_SYSTEM_SSH_AGENT:-com.openssh.ssh-agent}"
+ssh_agent_relogin_required=unknown
+open_bin="${SECURECRT_SYNC_OPEN:-/usr/bin/open}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -435,23 +438,28 @@ write_setup_state() {
   escaped_launch_path="$(xml_escape "$launch_agent_path")"
   escaped_launch_backup="$(xml_escape "$state_launch_before_backup")"
   escaped_launch_hash="$(xml_escape "$state_installed_launch_hash")"
+  escaped_system_agent_label="$(xml_escape "$system_ssh_agent_label")"
   config_before_boolean='<false/>'
   personal_before_boolean='<false/>'
   store_before_boolean='<false/>'
   agent_before_boolean='<false/>'
   launch_before_boolean='<false/>'
+  system_agent_before_boolean='<false/>'
+  system_agent_disabled_boolean='<false/>'
   [ "$state_config_before_present" = true ] && config_before_boolean='<true/>'
   [ "$state_personal_before_present" = true ] && personal_before_boolean='<true/>'
   [ "$state_store_before_present" = true ] && store_before_boolean='<true/>'
   [ "$state_agent_before_present" = true ] && agent_before_boolean='<true/>'
   [ "$state_launch_before_present" = true ] && launch_before_boolean='<true/>'
+  [ "$state_system_agent_disabled_before" = true ] && system_agent_before_boolean='<true/>'
+  [ "$state_system_agent_disabled_by_setup" = true ] && system_agent_disabled_boolean='<true/>'
 
   cat >"$candidate" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Version</key><integer>1</integer>
+  <key>Version</key><integer>2</integer>
   <key>Active</key><true/>
   <key>CreatedAt</key><string>$escaped_created_at</string>
   <key>UpdatedAt</key><string>$escaped_updated_at</string>
@@ -472,6 +480,9 @@ write_setup_state() {
   <key>LaunchAgentBeforePresent</key>$launch_before_boolean
   <key>LaunchAgentBeforeBackupPath</key><string>$escaped_launch_backup</string>
   <key>LaunchAgentInstalledSha256</key><string>$escaped_launch_hash</string>
+  <key>SystemSshAgentLabel</key><string>$escaped_system_agent_label</string>
+  <key>SystemSshAgentDisabledBefore</key>$system_agent_before_boolean
+  <key>SystemSshAgentDisabledBySetup</key>$system_agent_disabled_boolean
 </dict>
 </plist>
 EOF
@@ -518,10 +529,13 @@ state_is_active=false
 state_installed_launch_hash=""
 if [ -f "$state_path" ]; then
   state_version="$(plist_read "$state_path" Version || true)"
-  if [ "$state_version" != "1" ]; then
-    echo "Unsupported SecureCRT setup state version: $state_path" >&2
-    exit 1
-  fi
+  case "$state_version" in
+    1|2) ;;
+    *)
+      echo "Unsupported SecureCRT setup state version: $state_path" >&2
+      exit 1
+      ;;
+  esac
   if [ "$(plist_read "$state_path" Active || true)" = "true" ]; then
     state_is_active=true
   fi
@@ -540,6 +554,15 @@ if [ "$state_is_active" = true ]; then
   state_launch_before_present="$(plist_read "$state_path" LaunchAgentBeforePresent)"
   state_launch_before_backup="$(plist_read "$state_path" LaunchAgentBeforeBackupPath)"
   state_installed_launch_hash="$(plist_read "$state_path" LaunchAgentInstalledSha256)"
+  state_system_agent_disabled_before="$(plist_read "$state_path" SystemSshAgentDisabledBefore || true)"
+  if [ -n "$state_system_agent_disabled_before" ]; then
+    state_system_agent_before_present=true
+  else
+    state_system_agent_before_present=false
+    state_system_agent_disabled_before=false
+  fi
+  state_system_agent_disabled_by_setup="$(plist_read "$state_path" SystemSshAgentDisabledBySetup || true)"
+  [ -n "$state_system_agent_disabled_by_setup" ] || state_system_agent_disabled_by_setup=false
 else
   state_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   state_config_before_present="$old_config_present"
@@ -552,6 +575,9 @@ else
   state_agent_before="$old_agent_socket"
   [ -n "$old_agent_socket" ] && state_agent_before_present=true
   state_launch_before_present=false
+  state_system_agent_before_present=false
+  state_system_agent_disabled_before=false
+  state_system_agent_disabled_by_setup=false
 
   looks_like_legacy_install=false
   if [ "$old_config" = "$config_path" ] && [ "$old_personal" = "$personal_path" ] && \
@@ -626,6 +652,95 @@ fi
 state_updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_setup_state
 
+launch_domain="gui/$(id -u)"
+
+# macOS ships /System/Library/LaunchAgents/com.openssh.ssh-agent.plist, whose
+# Sockets > Listeners > SecureSocketWithKey entry tells launchd to publish the
+# built-in agent's socket as SSH_AUTH_SOCK. launchd injects that value into
+# every application started through Launch Services, and the injection wins
+# over "launchctl setenv". A GUI SecureCRT therefore talks to the built-in
+# agent, which holds no keys, and falls back to password authentication no
+# matter what this script sets. Note that "launchctl getenv" still reports the
+# value set below, so it cannot be used to verify the result.
+system_ssh_agent_is_disabled() {
+  disabled_line="$("$launchctl_bin" print-disabled "$launch_domain" 2>/dev/null | \
+    grep -F "\"$system_ssh_agent_label\"" || true)"
+  case "$disabled_line" in
+    *disabled*|*true*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Returns the SSH_AUTH_SOCK an application launched through Launch Services
+# actually inherits, which is the only value that reflects what SecureCRT will
+# see. Prints nothing when the probe cannot run, such as on a headless runner.
+probe_gui_ssh_auth_sock() {
+  probe_root="$(mktemp -d)"
+  probe_app="$probe_root/SecureCRTSyncAgentProbe.app"
+  probe_out="$probe_root/ssh-auth-sock"
+  mkdir -p "$probe_app/Contents/MacOS"
+  cat >"$probe_app/Contents/Info.plist" <<'PROBE_PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>SecureCRTSyncAgentProbe</string>
+  <key>CFBundleIdentifier</key><string>io.github.securecrtconfigsync.agentprobe</string>
+  <key>CFBundleName</key><string>SecureCRTSyncAgentProbe</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSBackgroundOnly</key><true/>
+</dict>
+</plist>
+PROBE_PLIST
+  cat >"$probe_app/Contents/MacOS/SecureCRTSyncAgentProbe" <<PROBE_MAIN
+#!/bin/sh
+printf '%s' "\${SSH_AUTH_SOCK:-}" >"$probe_out.tmp"
+mv "$probe_out.tmp" "$probe_out"
+PROBE_MAIN
+  chmod 0755 "$probe_app/Contents/MacOS/SecureCRTSyncAgentProbe"
+
+  if "$open_bin" -a "$probe_app" >/dev/null 2>&1; then
+    probe_waited=0
+    while [ ! -f "$probe_out" ] && [ "$probe_waited" -lt 50 ]; do
+      /bin/sleep 0.1
+      probe_waited=$((probe_waited + 1))
+    done
+    [ ! -f "$probe_out" ] || cat "$probe_out"
+  fi
+  rm -rf "$probe_root"
+}
+
+disable_system_ssh_agent() {
+  if [ "$state_system_agent_before_present" != true ]; then
+    if system_ssh_agent_is_disabled; then
+      state_system_agent_disabled_before=true
+    else
+      state_system_agent_disabled_before=false
+    fi
+    state_system_agent_before_present=true
+  fi
+
+  if system_ssh_agent_is_disabled; then
+    return
+  fi
+
+  if ! "$launchctl_bin" disable "$launch_domain/$system_ssh_agent_label" \
+      >/dev/null 2>&1; then
+    echo "Could not disable the built-in macOS SSH agent" \
+      "($system_ssh_agent_label)." >&2
+    echo "SecureCRT may keep prompting for passwords because macOS overrides" \
+      "SSH_AUTH_SOCK for applications started through Launch Services." >&2
+    return
+  fi
+  state_system_agent_disabled_by_setup=true
+
+  # System Integrity Protection refuses to unload the job in the running login
+  # session, so the change takes effect at the next login. Try anyway for the
+  # case where it is permitted.
+  "$launchctl_bin" bootout "$launch_domain/$system_ssh_agent_label" \
+    >/dev/null 2>&1 || true
+}
+
 configure_gui_ssh_agent() {
   socket_path="$1"
   mkdir -p "$launch_agent_dir"
@@ -669,7 +784,6 @@ EOF
   state_updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_setup_state
 
-  launch_domain="gui/$(id -u)"
   "$launchctl_bin" bootout "$launch_domain" "$launch_agent_path" >/dev/null 2>&1 || true
   "$launchctl_bin" bootstrap "$launch_domain" "$launch_agent_path"
   "$launchctl_bin" setenv SSH_AUTH_SOCK "$socket_path"
@@ -677,6 +791,20 @@ EOF
   if [ "$configured_socket" != "$socket_path" ]; then
     echo "Could not configure the GUI SSH agent socket." >&2
     exit 1
+  fi
+
+  disable_system_ssh_agent
+
+  # "launchctl getenv" reports the value written above even while macOS
+  # overrides it for GUI applications, so confirm against what an application
+  # started through Launch Services actually inherits.
+  gui_socket="$(probe_gui_ssh_auth_sock || true)"
+  if [ -z "$gui_socket" ]; then
+    ssh_agent_relogin_required=unknown
+  elif [ "$gui_socket" = "$socket_path" ]; then
+    ssh_agent_relogin_required=false
+  else
+    ssh_agent_relogin_required=true
   fi
 }
 
@@ -739,3 +867,25 @@ SecureCRT OneDrive setup is complete.
 The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd
 EOF
+
+case "$ssh_agent_relogin_required" in
+  true)
+    cat <<EOF
+
+Log out and back in before starting SecureCRT.
+
+macOS is still publishing its own SSH_AUTH_SOCK to applications started
+through Launch Services, which hides the 1Password agent and makes SecureCRT
+fall back to password prompts. The built-in agent ($system_ssh_agent_label) has
+been disabled for this user, but System Integrity Protection does not allow
+unloading it from the running login session.
+EOF
+    ;;
+  unknown)
+    cat <<EOF
+
+The GUI SSH agent socket could not be verified automatically. If SecureCRT
+prompts for a password, log out and back in, then try again.
+EOF
+    ;;
+esac

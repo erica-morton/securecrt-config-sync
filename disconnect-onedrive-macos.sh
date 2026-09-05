@@ -55,10 +55,13 @@ plist_read() {
   /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null
 }
 
-if [ "$(plist_read "$state_path" Version || true)" != "1" ]; then
-  echo "Unsupported SecureCRT setup state version: $state_path" >&2
-  exit 1
-fi
+case "$(plist_read "$state_path" Version || true)" in
+  1|2) ;;
+  *)
+    echo "Unsupported SecureCRT setup state version: $state_path" >&2
+    exit 1
+    ;;
+esac
 if [ "$(plist_read "$state_path" Active || true)" != "true" ]; then
   echo "This computer is already disconnected from SecureCRT OneDrive setup."
   echo "Personal Data was retained at $(plist_read "$state_path" PersonalDataPathInstalled)"
@@ -82,6 +85,9 @@ launch_agent_path="$(plist_read "$state_path" LaunchAgentPath)"
 launch_before_present="$(plist_read "$state_path" LaunchAgentBeforePresent)"
 launch_before_backup="$(plist_read "$state_path" LaunchAgentBeforeBackupPath)"
 launch_installed_hash="$(plist_read "$state_path" LaunchAgentInstalledSha256)"
+system_agent_label="$(plist_read "$state_path" SystemSshAgentLabel || true)"
+system_agent_disabled_before="$(plist_read "$state_path" SystemSshAgentDisabledBefore || true)"
+system_agent_disabled_by_setup="$(plist_read "$state_path" SystemSshAgentDisabledBySetup || true)"
 
 if [ "$launch_before_present" = true ] && [ ! -f "$launch_before_backup" ]; then
   echo "The recorded LaunchAgent backup is missing: $launch_before_backup" >&2
@@ -188,6 +194,19 @@ if [ "$agent_current" = "$agent_installed" ]; then
   fi
 else
   skips+=("GUI SSH agent environment value changed after setup")
+fi
+
+# Setup disables the built-in macOS SSH agent so that its SecureSocketWithKey
+# export stops overriding SSH_AUTH_SOCK for GUI applications. Put it back only
+# when setup is the one that disabled it.
+if [ "$system_agent_disabled_by_setup" = true ] && \
+    [ "$system_agent_disabled_before" != true ] && \
+    [ -n "$system_agent_label" ]; then
+  changes+=("re-enable the built-in macOS SSH agent ($system_agent_label)")
+  if [ "$dry_run" = false ]; then
+    "$launchctl_bin" enable "gui/$(id -u)/$system_agent_label" \
+      >/dev/null 2>&1 || true
+  fi
 fi
 
 launch_current_hash=""

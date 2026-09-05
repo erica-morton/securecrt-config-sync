@@ -89,6 +89,26 @@ shows the required steps, waits, retests, and continues when the agent is
 ready. It also publishes all macOS and Windows setup and disconnect helpers
 into the OneDrive `SecureCRT` folder.
 
+### The built-in macOS SSH agent
+
+macOS ships `/System/Library/LaunchAgents/com.openssh.ssh-agent.plist`, whose
+`Sockets` > `Listeners` > `SecureSocketWithKey` entry tells launchd to publish
+the built-in agent's socket as `SSH_AUTH_SOCK`. launchd injects that value into
+every application started through Launch Services, and the injection takes
+precedence over `launchctl setenv`. A GUI SecureCRT therefore reaches the
+built-in agent, which holds no keys, and falls back to password prompts on
+every session even though the LaunchAgent above is installed correctly.
+
+`launchctl getenv SSH_AUTH_SOCK` keeps reporting the value setup wrote, so it
+cannot detect this. Setup instead disables the built-in agent for the current
+user and then verifies the result by reading the `SSH_AUTH_SOCK` that a small
+throwaway application launched through Launch Services actually inherits.
+
+System Integrity Protection does not allow unloading the built-in agent from a
+running login session, so on a machine where it was still active setup asks for
+one log out and back in. Disconnect re-enables the built-in agent, but only
+when setup is the component that disabled it.
+
 ## Windows setup
 
 On the first Windows computer, extract all six helpers together and
