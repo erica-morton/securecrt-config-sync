@@ -22,6 +22,8 @@ launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
 system_ssh_agent_label="${SECURECRT_SYNC_SYSTEM_SSH_AGENT:-com.openssh.ssh-agent}"
 ssh_agent_relogin_required=unknown
 open_bin="${SECURECRT_SYNC_OPEN:-/usr/bin/open}"
+ssh_agent_disable_needs_root=false
+launchd_overrides_plist="${SECURECRT_SYNC_LAUNCHD_OVERRIDES:-/var/db/com.apple.xpc.launchd/disabled.$(id -u).plist}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -662,13 +664,15 @@ launch_domain="gui/$(id -u)"
 # agent, which holds no keys, and falls back to password authentication no
 # matter what this script sets. Note that "launchctl getenv" still reports the
 # value set below, so it cannot be used to verify the result.
-system_ssh_agent_is_disabled() {
-  disabled_line="$("$launchctl_bin" print-disabled "$launch_domain" 2>/dev/null | \
-    grep -F "\"$system_ssh_agent_label\"" || true)"
-  case "$disabled_line" in
-    *disabled*|*true*) return 0 ;;
-    *) return 1 ;;
-  esac
+# "launchctl disable" exits 0 and shows up in "launchctl print-disabled" even
+# when it changed nothing: the override database is owned by root, so an
+# unelevated call is silently discarded and the job comes back at the next
+# login. The database is world-readable, so check that the label really landed
+# in it rather than trusting either launchctl reply.
+system_ssh_agent_disable_persisted() {
+  [ -f "$launchd_overrides_plist" ] || return 1
+  [ "$(/usr/libexec/PlistBuddy -c "Print :$system_ssh_agent_label" \
+    "$launchd_overrides_plist" 2>/dev/null)" = true ]
 }
 
 # Returns the SSH_AUTH_SOCK an application launched through Launch Services
@@ -712,7 +716,7 @@ PROBE_MAIN
 
 disable_system_ssh_agent() {
   if [ "$state_system_agent_before_present" != true ]; then
-    if system_ssh_agent_is_disabled; then
+    if system_ssh_agent_disable_persisted; then
       state_system_agent_disabled_before=true
     else
       state_system_agent_disabled_before=false
@@ -720,19 +724,19 @@ disable_system_ssh_agent() {
     state_system_agent_before_present=true
   fi
 
-  if system_ssh_agent_is_disabled; then
+  if system_ssh_agent_disable_persisted; then
     return
   fi
 
-  if ! "$launchctl_bin" disable "$launch_domain/$system_ssh_agent_label" \
-      >/dev/null 2>&1; then
-    echo "Could not disable the built-in macOS SSH agent" \
-      "($system_ssh_agent_label)." >&2
-    echo "SecureCRT may keep prompting for passwords because macOS overrides" \
-      "SSH_AUTH_SOCK for applications started through Launch Services." >&2
+  "$launchctl_bin" disable "$launch_domain/$system_ssh_agent_label" \
+    >/dev/null 2>&1 || true
+
+  if system_ssh_agent_disable_persisted; then
+    state_system_agent_disabled_by_setup=true
+  else
+    ssh_agent_disable_needs_root=true
     return
   fi
-  state_system_agent_disabled_by_setup=true
 
   # System Integrity Protection refuses to unload the job in the running login
   # session, so the change takes effect at the next login. Try anyway for the
@@ -867,6 +871,22 @@ SecureCRT OneDrive setup is complete.
 The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd
 EOF
+
+if [ "$ssh_agent_disable_needs_root" = true ]; then
+  cat <<EOF
+
+The built-in macOS SSH agent is still enabled.
+
+Disabling it needs root, because /var/db/com.apple.xpc.launchd is owned by
+root. Until it is disabled, macOS keeps publishing its own SSH_AUTH_SOCK to
+applications started through Launch Services and SecureCRT will prompt for
+passwords. Run:
+
+  sudo launchctl disable $launch_domain/$system_ssh_agent_label
+
+then log out and back in.
+EOF
+fi
 
 case "$ssh_agent_relogin_required" in
   true)

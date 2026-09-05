@@ -18,6 +18,7 @@ cleanup() {
   defaults delete "$unsafe_migration_domain" >/dev/null 2>&1 || true
   defaults delete "$legacy_domain" >/dev/null 2>&1 || true
   defaults delete "io.github.securecrtconfigsync.probe.test.$$" >/dev/null 2>&1 || true
+  defaults delete "io.github.securecrtconfigsync.unelevated.test.$$" >/dev/null 2>&1 || true
   if [ -n "$agent_pid" ]; then
     kill "$agent_pid" >/dev/null 2>&1 || true
   fi
@@ -98,6 +99,11 @@ agent_socket="$test_root/1password-agent.sock"
 onepassword_app="$test_root/1Password.app"
 launchctl_state="$test_root/launchctl-ssh-auth-sock"
 launchctl_disabled="$test_root/launchctl-disabled"
+launchd_overrides="$test_root/launchd-overrides.plist"
+printf '%s\n' \
+  '<?xml version="1.0" encoding="UTF-8"?>' \
+  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+  '<plist version="1.0"><dict/></plist>' >"$launchd_overrides"
 launchctl_enabled="$test_root/launchctl-enabled"
 mock_launchctl="$test_root/mock-launchctl.sh"
 mkdir -p "$onepassword_app"
@@ -111,7 +117,14 @@ printf '%s\n' \
   '  unsetenv) : >"$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  getenv) [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_STATE" ] || cat "$SECURECRT_SYNC_LAUNCHCTL_STATE" ;;' \
   '  bootout|bootstrap) ;;' \
-  '  disable) printf "%s\\n" "$2" >>"$SECURECRT_SYNC_LAUNCHCTL_DISABLED" ;;' \
+  '  disable)' \
+  '    printf "%s\\n" "$2" >>"$SECURECRT_SYNC_LAUNCHCTL_DISABLED"' \
+  '    if [ "${SECURECRT_SYNC_MOCK_DISABLE_PERSISTS:-1}" = 1 ]; then' \
+  '      label="${2##*/}"' \
+  '      /usr/libexec/PlistBuddy -c "Add :$label bool true" \' \
+  '        "$SECURECRT_SYNC_LAUNCHD_OVERRIDES" >/dev/null 2>&1 || true' \
+  '    fi' \
+  '    ;;' \
   '  enable) printf "%s\\n" "$2" >>"$SECURECRT_SYNC_LAUNCHCTL_ENABLED" ;;' \
   '  print-disabled)' \
   '    [ ! -f "$SECURECRT_SYNC_LAUNCHCTL_DISABLED" ] || \' \
@@ -153,6 +166,7 @@ first_output="$(
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
@@ -218,6 +232,7 @@ SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
 SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
 SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
 SECURECRT_SYNC_OPEN="$mock_open" \
+SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
 "$installer" \
   --config "$config_path" \
   --personal "$personal_path" \
@@ -232,6 +247,7 @@ dry_run_output="$(
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   bash "$disconnect" --dry-run
 )"
 printf '%s\n' "$dry_run_output" | grep -Fq 'SecureCRT disconnect dry run:'
@@ -249,6 +265,7 @@ disconnect_output="$(
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   bash "$disconnect"
 )"
 printf '%s\n' "$disconnect_output" | grep -Fq 'SecureCRT disconnected:'
@@ -280,6 +297,7 @@ second_disconnect_output="$(
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   bash "$disconnect"
 )"
 printf '%s\n' "$second_disconnect_output" | grep -Fq 'already disconnected'
@@ -305,6 +323,7 @@ SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
 SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
 SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
 SECURECRT_SYNC_OPEN="$mock_open" \
+SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
 bash "$installer" \
   --config "$config_path" \
   --personal "$legacy_personal" \
@@ -323,6 +342,7 @@ SECURECRT_SYNC_LAUNCHCTL_STATE="$legacy_launchctl_state" \
 SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
 SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
 SECURECRT_SYNC_OPEN="$mock_open" \
+SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
 bash "$disconnect" >/dev/null
 assert_equal "$legacy_local_config" "$(defaults read "$legacy_domain" "Config Path")" \
   "legacy restored Config Path"
@@ -348,6 +368,7 @@ migration_output="$(
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   bash "$installer" \
     --personal "$migration_personal" \
     --preferences-domain "$migration_domain"
@@ -383,6 +404,7 @@ if HOME="$unsafe_migration_home" \
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
     bash "$installer" \
     --personal "$unsafe_migration_personal" \
     --preferences-domain "$unsafe_migration_domain" >/dev/null 2>&1; then
@@ -404,6 +426,7 @@ if HOME="$test_root/home" \
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
     "$installer" \
     --config "$partial_config" \
     --personal "$personal_path" \
@@ -421,6 +444,7 @@ if HOME="$test_root/home" \
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
     "$installer" \
     --config "$config_path" \
     --personal "$personal_path" \
@@ -447,6 +471,7 @@ run_probe_setup() {
   SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
   SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
   SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
   SECURECRT_SYNC_FAKE_GUI_SOCK="$1" \
   "$installer" \
     --config "$config_path" \
@@ -466,6 +491,46 @@ if printf '%s\n' "$healthy_output" | grep -Fq 'Log out and back in before starti
   exit 1
 fi
 defaults delete "$probe_domain" >/dev/null 2>&1 || true
+
+# "launchctl disable" exits 0 and appears in "launchctl print-disabled" even
+# when the override database was not written, because that database is owned by
+# root. Setup must notice and ask for the elevated command instead of reporting
+# success on a machine where the built-in agent returns at the next login.
+unelevated_home="$test_root/unelevated-home"
+unelevated_domain="io.github.securecrtconfigsync.unelevated.test.$$"
+unelevated_overrides="$test_root/unelevated-overrides.plist"
+mkdir -p "$unelevated_home"
+printf '%s\n' \
+  '<?xml version="1.0" encoding="UTF-8"?>' \
+  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+  '<plist version="1.0"><dict/></plist>' >"$unelevated_overrides"
+
+unelevated_output="$(
+  HOME="$unelevated_home" \
+  SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+  SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$unelevated_overrides" \
+  SECURECRT_SYNC_MOCK_DISABLE_PERSISTS=0 \
+  "$installer" \
+    --config "$config_path" \
+    --personal "$test_root/unelevated-personal" \
+    --preferences-domain "$unelevated_domain"
+)"
+
+if ! printf '%s\n' "$unelevated_output" | grep -Fq 'sudo launchctl disable'; then
+  echo "Setup did not ask for the elevated disable after it was discarded." >&2
+  exit 1
+fi
+unelevated_state="$unelevated_home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+assert_equal "false" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :SystemSshAgentDisabledBySetup' "$unelevated_state")" \
+  "no rollback claim when the disable was discarded"
+defaults delete "$unelevated_domain" >/dev/null 2>&1 || true
 
 
 echo "macOS SecureCRT setup integration test passed."
