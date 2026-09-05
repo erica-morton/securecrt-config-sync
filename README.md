@@ -109,6 +109,17 @@ running login session, so on a machine where it was still active setup asks for
 one log out and back in. Disconnect re-enables the built-in agent, but only
 when setup is the component that disabled it.
 
+Disabling the job needs root. `/var/db/com.apple.xpc.launchd` is owned by root,
+and an unelevated `launchctl disable` still exits 0 and still shows the job as
+disabled in `launchctl print-disabled`, while writing nothing — so the built-in
+agent returns at the next login and the password prompts come back. Setup
+confirms the label actually landed in the override database and, when it did
+not, prints the elevated command to run:
+
+```bash
+sudo launchctl disable gui/$(id -u)/com.openssh.ssh-agent
+```
+
 ## Windows setup
 
 On the first Windows computer, extract all six helpers together and
