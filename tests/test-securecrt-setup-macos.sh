@@ -75,12 +75,37 @@ mkdir -p "$personal_path/Sessions/Example Group"
 printf '\357\273\277S:"Password V2"=preserve-me\r\nS:"Username"=wrong-user\r\n' \
   >"$personal_path/Sessions/Example Group/host-one.ini"
 
+# Stands in for an installed SecureCRT. Defined before the first installer run
+# so the suite never depends on the runner having SecureCRT in /Applications.
+fake_securecrt_app="$test_root/SecureCRT.app"
+mkdir -p "$fake_securecrt_app/Contents/MacOS" "$fake_securecrt_app/Contents/Resources"
+printf '#!/bin/sh\nexit 0\n' >"$fake_securecrt_app/Contents/MacOS/SecureCRT"
+chmod 0755 "$fake_securecrt_app/Contents/MacOS/SecureCRT"
+
+# The launcher execs SecureCRT's binary, so setup must refuse to build one
+# pointing at an application that is not there rather than install a launcher
+# that dies silently when double-clicked.
+missing_app_output="$test_root/missing-app-output.txt"
+if HOME="$test_root/missing-app-home" \
+    SECURECRT_SYNC_SECURECRT_APP="$test_root/absent-SecureCRT.app" \
+    "$installer" \
+    --config "$config_path" \
+    --personal "$test_root/missing-app-personal" \
+    --preferences-domain "$preferences_domain" \
+    </dev/null >"$missing_app_output" 2>&1; then
+  echo "The installer accepted a missing SecureCRT application." >&2
+  exit 1
+fi
+grep -Fq 'SecureCRT was not found at' "$missing_app_output"
+grep -Fq 'SECURECRT_SYNC_SECURECRT_APP' "$missing_app_output"
+
 gate_home="$test_root/gate-home"
 gate_personal="$test_root/gate-personal"
 gate_output="$test_root/gate-output.txt"
 if HOME="$gate_home" \
     SECURECRT_SYNC_ONEPASSWORD_APP="$test_root/missing-1Password.app" \
     SECURECRT_SYNC_ONEPASSWORD_SOCKET="$test_root/missing-agent.sock" \
+    SECURECRT_SYNC_SECURECRT_APP="$fake_securecrt_app" \
     "$installer" \
     --config "$config_path" \
     --personal "$gate_personal" \
@@ -101,11 +126,7 @@ onepassword_app="$test_root/1Password.app"
 launchctl_state="$test_root/launchctl-ssh-auth-sock"
 launchctl_disabled="$test_root/launchctl-disabled"
 launchd_overrides="$test_root/launchd-overrides.plist"
-fake_securecrt_app="$test_root/SecureCRT.app"
 launcher_app="$test_root/Applications/SecureCRT (1Password).app"
-mkdir -p "$fake_securecrt_app/Contents/MacOS" "$fake_securecrt_app/Contents/Resources"
-printf '#!/bin/sh\nexit 0\n' >"$fake_securecrt_app/Contents/MacOS/SecureCRT"
-chmod 0755 "$fake_securecrt_app/Contents/MacOS/SecureCRT"
 printf '%s\n' \
   '<?xml version="1.0" encoding="UTF-8"?>' \
   '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
