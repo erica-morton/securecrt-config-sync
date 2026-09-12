@@ -20,9 +20,10 @@ onepassword_app="${SECURECRT_SYNC_ONEPASSWORD_APP:-/Applications/1Password.app}"
 ssh_agent_socket="${SECURECRT_SYNC_ONEPASSWORD_SOCKET:-$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock}"
 launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
 system_ssh_agent_label="${SECURECRT_SYNC_SYSTEM_SSH_AGENT:-com.openssh.ssh-agent}"
-ssh_agent_relogin_required=unknown
+launcher_required=unknown
 open_bin="${SECURECRT_SYNC_OPEN:-/usr/bin/open}"
-ssh_agent_disable_needs_root=false
+securecrt_app="${SECURECRT_SYNC_SECURECRT_APP:-/Applications/SecureCRT.app}"
+launcher_app="${SECURECRT_SYNC_LAUNCHER_APP:-$HOME/Applications/SecureCRT (1Password).app}"
 launchd_overrides_plist="${SECURECRT_SYNC_LAUNCHD_OVERRIDES:-/var/db/com.apple.xpc.launchd/disabled.$(id -u).plist}"
 
 while [ "$#" -gt 0 ]; do
@@ -441,6 +442,8 @@ write_setup_state() {
   escaped_launch_backup="$(xml_escape "$state_launch_before_backup")"
   escaped_launch_hash="$(xml_escape "$state_installed_launch_hash")"
   escaped_system_agent_label="$(xml_escape "$system_ssh_agent_label")"
+  escaped_launcher_app="$(xml_escape "$launcher_app")"
+  escaped_launcher_hash="$(xml_escape "$state_launcher_installed_hash")"
   config_before_boolean='<false/>'
   personal_before_boolean='<false/>'
   store_before_boolean='<false/>'
@@ -448,6 +451,7 @@ write_setup_state() {
   launch_before_boolean='<false/>'
   system_agent_before_boolean='<false/>'
   system_agent_disabled_boolean='<false/>'
+  launcher_before_boolean='<false/>'
   [ "$state_config_before_present" = true ] && config_before_boolean='<true/>'
   [ "$state_personal_before_present" = true ] && personal_before_boolean='<true/>'
   [ "$state_store_before_present" = true ] && store_before_boolean='<true/>'
@@ -455,13 +459,14 @@ write_setup_state() {
   [ "$state_launch_before_present" = true ] && launch_before_boolean='<true/>'
   [ "$state_system_agent_disabled_before" = true ] && system_agent_before_boolean='<true/>'
   [ "$state_system_agent_disabled_by_setup" = true ] && system_agent_disabled_boolean='<true/>'
+  [ "$state_launcher_before_present" = true ] && launcher_before_boolean='<true/>'
 
   cat >"$candidate" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Version</key><integer>2</integer>
+  <key>Version</key><integer>3</integer>
   <key>Active</key><true/>
   <key>CreatedAt</key><string>$escaped_created_at</string>
   <key>UpdatedAt</key><string>$escaped_updated_at</string>
@@ -485,6 +490,9 @@ write_setup_state() {
   <key>SystemSshAgentLabel</key><string>$escaped_system_agent_label</string>
   <key>SystemSshAgentDisabledBefore</key>$system_agent_before_boolean
   <key>SystemSshAgentDisabledBySetup</key>$system_agent_disabled_boolean
+  <key>LauncherAppPath</key><string>$escaped_launcher_app</string>
+  <key>LauncherAppBeforePresent</key>$launcher_before_boolean
+  <key>LauncherAppInstalledSha256</key><string>$escaped_launcher_hash</string>
 </dict>
 </plist>
 EOF
@@ -529,10 +537,11 @@ old_agent_socket="$($launchctl_bin getenv SSH_AUTH_SOCK 2>/dev/null || true)"
 
 state_is_active=false
 state_installed_launch_hash=""
+state_launcher_installed_hash=""
 if [ -f "$state_path" ]; then
   state_version="$(plist_read "$state_path" Version || true)"
   case "$state_version" in
-    1|2) ;;
+    1|2|3) ;;
     *)
       echo "Unsupported SecureCRT setup state version: $state_path" >&2
       exit 1
@@ -565,6 +574,8 @@ if [ "$state_is_active" = true ]; then
   fi
   state_system_agent_disabled_by_setup="$(plist_read "$state_path" SystemSshAgentDisabledBySetup || true)"
   [ -n "$state_system_agent_disabled_by_setup" ] || state_system_agent_disabled_by_setup=false
+  state_launcher_before_present="$(plist_read "$state_path" LauncherAppBeforePresent || true)"
+  [ "$state_launcher_before_present" = true ] || state_launcher_before_present=false
 else
   state_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   state_config_before_present="$old_config_present"
@@ -580,6 +591,7 @@ else
   state_system_agent_before_present=false
   state_system_agent_disabled_before=false
   state_system_agent_disabled_by_setup=false
+  state_launcher_before_present=false
 
   looks_like_legacy_install=false
   if [ "$old_config" = "$config_path" ] && [ "$old_personal" = "$personal_path" ] && \
@@ -661,19 +673,22 @@ launch_domain="gui/$(id -u)"
 # built-in agent's socket as SSH_AUTH_SOCK. launchd injects that value into
 # every application started through Launch Services, and the injection wins
 # over "launchctl setenv". A GUI SecureCRT therefore talks to the built-in
-# agent, which holds no keys, and falls back to password authentication no
-# matter what this script sets. Note that "launchctl getenv" still reports the
-# value set below, so it cannot be used to verify the result.
-# "launchctl disable" exits 0 and shows up in "launchctl print-disabled" even
-# when it changed nothing: the override database is owned by root, so an
-# unelevated call is silently discarded and the job comes back at the next
-# login. The database is world-readable, so check that the label really landed
-# in it rather than trusting either launchctl reply.
-system_ssh_agent_disable_persisted() {
-  [ -f "$launchd_overrides_plist" ] || return 1
-  [ "$(/usr/libexec/PlistBuddy -c "Print :$system_ssh_agent_label" \
-    "$launchd_overrides_plist" 2>/dev/null)" = true ]
-}
+# agent, which holds no keys, and falls back to password authentication.
+#
+# That injection cannot be turned off for the login session. "launchctl
+# disable" needs root to reach the override database, and even a successful
+# elevated write does not survive a reboot: macOS rewrites
+# /var/db/com.apple.xpc.launchd/disabled.<uid>.plist at boot and drops the
+# entry for this SIP-protected job while leaving unrelated entries intact.
+# Booting the job out of the running session is refused under SIP as well.
+#
+# So do not fight the environment - own the launch. The launcher bundle below
+# execs SecureCRT's real binary with SSH_AUTH_SOCK already set, which is the
+# long-standing macOS pattern for giving a GUI application a specific
+# environment. SecureCRT has no setting to point at a different agent socket,
+# and VanDyke shipped no functional agent change between 9.4.3 and 9.7.3, so
+# this is the fix on every current version rather than a workaround for an old
+# one.
 
 # Returns the SSH_AUTH_SOCK an application launched through Launch Services
 # actually inherits, which is the only value that reflects what SecureCRT will
@@ -714,35 +729,75 @@ PROBE_MAIN
   rm -rf "$probe_root"
 }
 
-disable_system_ssh_agent() {
-  if [ "$state_system_agent_before_present" != true ]; then
-    if system_ssh_agent_disable_persisted; then
-      state_system_agent_disabled_before=true
-    else
-      state_system_agent_disabled_before=false
+install_agent_launcher() {
+  socket_path="$1"
+  launcher_exec="$launcher_app/Contents/MacOS/launcher"
+  launcher_staging="$(mktemp -d)"
+  staged_app="$launcher_staging/bundle.app"
+  mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
+
+  escaped_launcher_name="$(xml_escape "$(basename "$launcher_app" .app)")"
+  cat >"$staged_app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>launcher</string>
+  <key>CFBundleIdentifier</key><string>io.github.securecrtconfigsync.securecrt-launcher</string>
+  <key>CFBundleName</key><string>$escaped_launcher_name</string>
+  <key>CFBundleIconFile</key><string>app.icns</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+</dict>
+</plist>
+EOF
+
+  # exec replaces this shell with SecureCRT's own binary, so the running
+  # process is ordinary SecureCRT: same bundle identity, icon and preferences.
+  cat >"$staged_app/Contents/MacOS/launcher" <<EOF
+#!/bin/sh
+# Generated by setup-onedrive-macos.sh. macOS publishes its own SSH_AUTH_SOCK
+# to everything Launch Services starts, overriding launchctl setenv, and the
+# built-in SSH agent cannot be disabled persistently under SIP. Setting the
+# variable here is the one place that holds.
+exec env SSH_AUTH_SOCK="$socket_path" \\
+  "$securecrt_app/Contents/MacOS/SecureCRT" "\$@"
+EOF
+  chmod 0755 "$staged_app/Contents/MacOS/launcher"
+
+  icon_name="$(defaults read "$securecrt_app/Contents/Info.plist" CFBundleIconFile \
+    2>/dev/null || true)"
+  case "$icon_name" in
+    "") ;;
+    *.icns) ;;
+    *) icon_name="$icon_name.icns" ;;
+  esac
+  if [ -n "$icon_name" ] && [ -f "$securecrt_app/Contents/Resources/$icon_name" ]; then
+    cp "$securecrt_app/Contents/Resources/$icon_name" \
+      "$staged_app/Contents/Resources/app.icns"
+  fi
+
+  if [ -e "$launcher_app" ]; then
+    if [ -f "$launcher_exec" ] && \
+        cmp -s "$staged_app/Contents/MacOS/launcher" "$launcher_exec"; then
+      rm -rf "$launcher_staging"
+      state_launcher_installed_hash="$(shasum -a 256 "$launcher_exec" | awk '{print $1}')"
+      return
     fi
-    state_system_agent_before_present=true
+    if [ "$state_launcher_before_present" != true ]; then
+      state_launcher_before_present=true
+    fi
+    rm -rf "$launcher_app"
   fi
 
-  if system_ssh_agent_disable_persisted; then
-    return
-  fi
-
-  "$launchctl_bin" disable "$launch_domain/$system_ssh_agent_label" \
-    >/dev/null 2>&1 || true
-
-  if system_ssh_agent_disable_persisted; then
-    state_system_agent_disabled_by_setup=true
-  else
-    ssh_agent_disable_needs_root=true
-    return
-  fi
-
-  # System Integrity Protection refuses to unload the job in the running login
-  # session, so the change takes effect at the next login. Try anyway for the
-  # case where it is permitted.
-  "$launchctl_bin" bootout "$launch_domain/$system_ssh_agent_label" \
-    >/dev/null 2>&1 || true
+  mkdir -p "$(dirname "$launcher_app")"
+  mv "$staged_app" "$launcher_app"
+  rm -rf "$launcher_staging"
+  # Locally generated bundles carry no quarantine flag, but strip it defensively
+  # so Gatekeeper never blocks a launcher this script created.
+  /usr/bin/xattr -dr com.apple.quarantine "$launcher_app" >/dev/null 2>&1 || true
+  state_launcher_installed_hash="$(shasum -a 256 "$launcher_exec" | awk '{print $1}')"
 }
 
 configure_gui_ssh_agent() {
@@ -797,18 +852,19 @@ EOF
     exit 1
   fi
 
-  disable_system_ssh_agent
+  install_agent_launcher "$socket_path"
 
   # "launchctl getenv" reports the value written above even while macOS
   # overrides it for GUI applications, so confirm against what an application
-  # started through Launch Services actually inherits.
+  # started through Launch Services actually inherits. This decides whether
+  # SecureCRT has to be started through the launcher, not whether setup worked.
   gui_socket="$(probe_gui_ssh_auth_sock || true)"
   if [ -z "$gui_socket" ]; then
-    ssh_agent_relogin_required=unknown
+    launcher_required=unknown
   elif [ "$gui_socket" = "$socket_path" ]; then
-    ssh_agent_relogin_required=false
+    launcher_required=false
   else
-    ssh_agent_relogin_required=true
+    launcher_required=true
   fi
 }
 
@@ -872,40 +928,32 @@ The Windows one-click setup is now available at:
   $securecrt_root/setup-onedrive-windows.cmd
 EOF
 
-if [ "$ssh_agent_disable_needs_root" = true ]; then
-  cat <<EOF
-
-The built-in macOS SSH agent is still enabled.
-
-Disabling it needs root, because /var/db/com.apple.xpc.launchd is owned by
-root. Until it is disabled, macOS keeps publishing its own SSH_AUTH_SOCK to
-applications started through Launch Services and SecureCRT will prompt for
-passwords. Run:
-
-  sudo launchctl disable $launch_domain/$system_ssh_agent_label
-
-then log out and back in.
-EOF
-fi
-
-case "$ssh_agent_relogin_required" in
-  true)
+case "$launcher_required" in
+  true|unknown)
     cat <<EOF
 
-Log out and back in before starting SecureCRT.
+Start SecureCRT from the launcher, not from $securecrt_app:
 
-macOS is still publishing its own SSH_AUTH_SOCK to applications started
-through Launch Services, which hides the 1Password agent and makes SecureCRT
-fall back to password prompts. The built-in agent ($system_ssh_agent_label) has
-been disabled for this user, but System Integrity Protection does not allow
-unloading it from the running login session.
+  $launcher_app
+
+Drag it into the Dock and remove the old SecureCRT tile. It runs SecureCRT's
+own binary, so it is ordinary SecureCRT once open - same icon, preferences and
+license - but with SSH_AUTH_SOCK pointing at the 1Password agent.
+
+macOS publishes its own SSH_AUTH_SOCK to everything started through Launch
+Services, and that cannot be switched off for good: disabling the built-in SSH
+agent needs root and does not survive a reboot under System Integrity
+Protection. Opening $(basename "$securecrt_app") directly will keep prompting for passwords.
 EOF
     ;;
-  unknown)
+  false)
     cat <<EOF
 
-The GUI SSH agent socket could not be verified automatically. If SecureCRT
-prompts for a password, log out and back in, then try again.
+GUI applications already inherit the 1Password agent socket, so SecureCRT can
+be started normally. The launcher at the path below is installed anyway and is
+safe to use either way:
+
+  $launcher_app
 EOF
     ;;
 esac

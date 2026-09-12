@@ -56,7 +56,7 @@ plist_read() {
 }
 
 case "$(plist_read "$state_path" Version || true)" in
-  1|2) ;;
+  1|2|3) ;;
   *)
     echo "Unsupported SecureCRT setup state version: $state_path" >&2
     exit 1
@@ -88,6 +88,9 @@ launch_installed_hash="$(plist_read "$state_path" LaunchAgentInstalledSha256)"
 system_agent_label="$(plist_read "$state_path" SystemSshAgentLabel || true)"
 system_agent_disabled_before="$(plist_read "$state_path" SystemSshAgentDisabledBefore || true)"
 system_agent_disabled_by_setup="$(plist_read "$state_path" SystemSshAgentDisabledBySetup || true)"
+launcher_app="$(plist_read "$state_path" LauncherAppPath || true)"
+launcher_before_present="$(plist_read "$state_path" LauncherAppBeforePresent || true)"
+launcher_installed_hash="$(plist_read "$state_path" LauncherAppInstalledSha256 || true)"
 
 if [ "$launch_before_present" = true ] && [ ! -f "$launch_before_backup" ]; then
   echo "The recorded LaunchAgent backup is missing: $launch_before_backup" >&2
@@ -196,7 +199,27 @@ else
   skips+=("GUI SSH agent environment value changed after setup")
 fi
 
-# Setup disables the built-in macOS SSH agent so that its SecureSocketWithKey
+if [ -n "$launcher_app" ] && [ -n "$launcher_installed_hash" ] && \
+    [ "$launcher_before_present" != true ]; then
+  launcher_exec="$launcher_app/Contents/MacOS/launcher"
+  launcher_current_hash=""
+  if [ -f "$launcher_exec" ]; then
+    launcher_current_hash="$(shasum -a 256 "$launcher_exec" | awk '{print $1}')"
+  fi
+  if [ ! -e "$launcher_app" ]; then
+    : # already gone
+  elif [ "$launcher_current_hash" = "$launcher_installed_hash" ]; then
+    changes+=("remove the SecureCRT agent launcher ($launcher_app)")
+    if [ "$dry_run" = false ]; then
+      rm -rf "$launcher_app"
+    fi
+  else
+    skips+=("SecureCRT agent launcher changed after setup")
+  fi
+fi
+
+# Older setups tried to disable the built-in macOS SSH agent so that its
+# SecureSocketWithKey
 # export stops overriding SSH_AUTH_SOCK for GUI applications. Put it back only
 # when setup is the one that disabled it.
 if [ "$system_agent_disabled_by_setup" = true ] && \
