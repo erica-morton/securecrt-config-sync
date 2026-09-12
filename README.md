@@ -82,12 +82,15 @@ bash ./setup-onedrive-macos.sh \
 ```
 
 The Mac helper can originate or join the share. It requires the 1Password SSH
-agent socket and creates a user
-LaunchAgent so SecureCRT opened from Finder or the Dock inherits that socket
-after every login. If 1Password or its agent is unavailable, interactive setup
-shows the required steps, waits, retests, and continues when the agent is
-ready. It also publishes all macOS and Windows setup and disconnect helpers
-into the OneDrive `SecureCRT` folder.
+agent socket, installs a launcher that starts SecureCRT with that socket, and
+creates a user LaunchAgent that sets `SSH_AUTH_SOCK` for processes launchd
+starts. Start SecureCRT from the launcher: macOS overrides `SSH_AUTH_SOCK` for
+anything opened through Finder or the Dock, and that cannot be turned off - see
+[The built-in macOS SSH agent](#the-built-in-macos-ssh-agent) below. If
+1Password or its agent is unavailable, interactive setup shows the required
+steps, waits, retests, and continues when the agent is ready. It also publishes
+all macOS and Windows setup and disconnect helpers into the OneDrive
+`SecureCRT` folder.
 
 ### The built-in macOS SSH agent
 
@@ -96,43 +99,68 @@ macOS ships `/System/Library/LaunchAgents/com.openssh.ssh-agent.plist`, whose
 the built-in agent's socket as `SSH_AUTH_SOCK`. launchd injects that value into
 every application started through Launch Services, and the injection takes
 precedence over `launchctl setenv`. A GUI SecureCRT therefore reaches the
-built-in agent, which holds no keys, and falls back to password prompts on
-every session even though the LaunchAgent above is installed correctly.
+built-in agent, which holds no keys, and prompts for a password on every
+session.
 
-`launchctl getenv SSH_AUTH_SOCK` keeps reporting the value setup wrote, so it
-cannot detect this. Setup instead disables the built-in agent for the current
-user and then verifies the result by reading the `SSH_AUTH_SOCK` that a small
-throwaway application launched through Launch Services actually inherits.
+The override is specific to that one variable: another variable set with
+`launchctl setenv` reaches a GUI application normally.
 
-System Integrity Protection does not allow unloading the built-in agent from a
-running login session, so on a machine where it was still active setup asks for
-one log out and back in. Disconnect re-enables the built-in agent, but only
-when setup is the component that disabled it.
+**It cannot be switched off.** `launchctl disable` needs root to reach
+`/var/db/com.apple.xpc.launchd`, and an unelevated call still exits 0 and still
+reports the job as disabled through `launchctl print-disabled` while writing
+nothing. Even a successful elevated write does not survive a reboot: macOS
+rewrites the override database at boot and drops the entry for this
+SIP-protected job while leaving dozens of unrelated entries intact. Unloading
+it from the running session is refused under SIP, with or without root.
 
-Disabling the job needs root. `/var/db/com.apple.xpc.launchd` is owned by root,
-and an unelevated `launchctl disable` still exits 0 and still shows the job as
-disabled in `launchctl print-disabled`, while writing nothing — so the built-in
-agent returns at the next login and the password prompts come back. Setup
-confirms the label actually landed in the override database and, when it did
-not, prints the elevated command to run:
+Nor is there anything to configure in SecureCRT. It has no agent socket setting
+and does not read `ssh_config`, so `IdentityAgent` - the override that keeps
+the OpenSSH command line working - does not apply. VanDyke shipped no
+functional SSH agent change between 9.4.3 and 9.7.3, so upgrading does not
+help.
 
-```bash
-sudo launchctl disable gui/$(id -u)/com.openssh.ssh-agent
+### The launcher
+
+Setup therefore owns the launch instead of the environment. It installs
+
+```text
+~/Applications/SecureCRT (1Password).app
 ```
+
+a small bundle whose executable is:
+
+```sh
+exec env SSH_AUTH_SOCK="<1Password agent socket>" \
+  "/Applications/SecureCRT.app/Contents/MacOS/SecureCRT" "$@"
+```
+
+`exec` replaces the shell with SecureCRT's own binary, so the running process
+is ordinary SecureCRT - same bundle identity, icon, preferences and license -
+started with the right agent. Drag it into the Dock and remove the old
+SecureCRT tile. Giving a GUI application a specific environment through a
+wrapper bundle is the long-standing macOS pattern for this, and it needs no
+elevation and no SIP change.
+
+Setup still verifies what an application started through Launch Services
+actually inherits, because `launchctl getenv SSH_AUTH_SOCK` reports the value
+that was set rather than the one applications receive. That probe decides
+whether the launcher is required on a given machine, and its result is printed
+at the end of setup. Disconnect removes the launcher, unless it was modified
+after setup created it.
 
 ### Diagnosing password prompts
 
-When SecureCRT prompts for a password instead of using the agent, run:
+When SecureCRT prompts for a password, run:
 
 ```bash
 bash ./diagnose-ssh-agent-macos.sh
 ```
 
-It checks each link in turn - the 1Password agent, whether the built-in agent
-is disabled in the override database, whether it is still loaded in this login
-session, the sync LaunchAgent, the `SSH_AUTH_SOCK` a Launch Services
-application actually inherits, and the value the running SecureCRT holds - then
-prints a diagnosis and the command to fix it. It changes nothing.
+It checks each link in turn - the 1Password agent, the launcher, the sync
+LaunchAgent, the `SSH_AUTH_SOCK` a Launch Services application actually
+inherits, and the value the running SecureCRT holds - then names the failing
+link and prints the command that fixes it. The usual answer is that SecureCRT
+was opened directly rather than through the launcher. It changes nothing.
 
 ## Windows setup
 
