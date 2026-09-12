@@ -24,6 +24,16 @@ launcher_required=unknown
 open_bin="${SECURECRT_SYNC_OPEN:-/usr/bin/open}"
 securecrt_app="${SECURECRT_SYNC_SECURECRT_APP:-/Applications/SecureCRT.app}"
 launcher_app="${SECURECRT_SYNC_LAUNCHER_APP:-$HOME/Applications/SecureCRT (1Password).app}"
+# The launcher embeds these two paths in a generated shell script, so a value
+# carrying shell metacharacters would be expanded when the launcher runs.
+for guarded_path in "$securecrt_app" "$launcher_app"; do
+  case "$guarded_path" in
+    *'$'*|*'`'*|*'"'*|*'\'*)
+      echo "Path contains characters that cannot be embedded safely: $guarded_path" >&2
+      exit 1
+      ;;
+  esac
+done
 launchd_overrides_plist="${SECURECRT_SYNC_LAUNCHD_OVERRIDES:-/var/db/com.apple.xpc.launchd/disabled.$(id -u).plist}"
 
 while [ "$#" -gt 0 ]; do
@@ -112,6 +122,19 @@ EOF
   done
   echo "1Password SSH agent is ready. Continuing setup."
 }
+
+if [ ! -x "$securecrt_app/Contents/MacOS/SecureCRT" ]; then
+  cat >&2 <<EOF
+SecureCRT was not found at:
+  $securecrt_app
+
+The launcher this script installs execs that binary, so it would fail silently
+when opened. Install SecureCRT there, or point setup at it:
+
+  SECURECRT_SYNC_SECURECRT_APP=/path/to/SecureCRT.app bash ./setup-onedrive-macos.sh
+EOF
+  exit 1
+fi
 
 wait_for_onepassword_agent
 
@@ -576,6 +599,8 @@ if [ "$state_is_active" = true ]; then
   [ -n "$state_system_agent_disabled_by_setup" ] || state_system_agent_disabled_by_setup=false
   state_launcher_before_present="$(plist_read "$state_path" LauncherAppBeforePresent || true)"
   [ "$state_launcher_before_present" = true ] || state_launcher_before_present=false
+  state_launcher_recorded_hash="$(plist_read "$state_path" LauncherAppInstalledSha256 || true)"
+  state_launcher_installed_hash="$state_launcher_recorded_hash"
 else
   state_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   state_config_before_present="$old_config_present"
@@ -592,6 +617,7 @@ else
   state_system_agent_disabled_before=false
   state_system_agent_disabled_by_setup=false
   state_launcher_before_present=false
+  state_launcher_recorded_hash=""
 
   looks_like_legacy_install=false
   if [ "$old_config" = "$config_path" ] && [ "$old_personal" = "$personal_path" ] && \
@@ -737,6 +763,20 @@ install_agent_launcher() {
   mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
 
   escaped_launcher_name="$(xml_escape "$(basename "$launcher_app" .app)")"
+
+  icon_name="$(defaults read "$securecrt_app/Contents/Info.plist" CFBundleIconFile \
+    2>/dev/null || true)"
+  case "$icon_name" in
+    "") ;;
+    *.icns) ;;
+    *) icon_name="$icon_name.icns" ;;
+  esac
+  launcher_icon_key=""
+  if [ -n "$icon_name" ] && [ -f "$securecrt_app/Contents/Resources/$icon_name" ]; then
+    cp "$securecrt_app/Contents/Resources/$icon_name" \
+      "$staged_app/Contents/Resources/app.icns"
+    launcher_icon_key='  <key>CFBundleIconFile</key><string>app.icns</string>'
+  fi
   cat >"$staged_app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -745,8 +785,7 @@ install_agent_launcher() {
   <key>CFBundleExecutable</key><string>launcher</string>
   <key>CFBundleIdentifier</key><string>io.github.securecrtconfigsync.securecrt-launcher</string>
   <key>CFBundleName</key><string>$escaped_launcher_name</string>
-  <key>CFBundleIconFile</key><string>app.icns</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
+$launcher_icon_key  <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
 </dict>
@@ -766,26 +805,25 @@ exec env SSH_AUTH_SOCK="$socket_path" \\
 EOF
   chmod 0755 "$staged_app/Contents/MacOS/launcher"
 
-  icon_name="$(defaults read "$securecrt_app/Contents/Info.plist" CFBundleIconFile \
-    2>/dev/null || true)"
-  case "$icon_name" in
-    "") ;;
-    *.icns) ;;
-    *) icon_name="$icon_name.icns" ;;
-  esac
-  if [ -n "$icon_name" ] && [ -f "$securecrt_app/Contents/Resources/$icon_name" ]; then
-    cp "$securecrt_app/Contents/Resources/$icon_name" \
-      "$staged_app/Contents/Resources/app.icns"
-  fi
-
   if [ -e "$launcher_app" ]; then
-    if [ -f "$launcher_exec" ] && \
-        cmp -s "$staged_app/Contents/MacOS/launcher" "$launcher_exec"; then
-      rm -rf "$launcher_staging"
-      state_launcher_installed_hash="$(shasum -a 256 "$launcher_exec" | awk '{print $1}')"
-      return
+    existing_hash=""
+    if [ -f "$launcher_exec" ]; then
+      existing_hash="$(shasum -a 256 "$launcher_exec" | awk '{print $1}')"
+      if cmp -s "$staged_app/Contents/MacOS/launcher" "$launcher_exec"; then
+        rm -rf "$launcher_staging"
+        state_launcher_installed_hash="$existing_hash"
+        return
+      fi
     fi
-    if [ "$state_launcher_before_present" != true ]; then
+    # Regenerating a launcher setup itself wrote must not look like one the
+    # user already had, or disconnect would skip removing it for good.
+    setup_wrote_existing=false
+    if [ -n "$state_launcher_recorded_hash" ] && \
+        [ "$existing_hash" = "$state_launcher_recorded_hash" ]; then
+      setup_wrote_existing=true
+    fi
+    if [ "$setup_wrote_existing" != true ] && \
+        [ "$state_launcher_before_present" != true ]; then
       state_launcher_before_present=true
     fi
     rm -rf "$launcher_app"

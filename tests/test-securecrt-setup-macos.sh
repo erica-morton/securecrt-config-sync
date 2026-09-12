@@ -18,6 +18,8 @@ cleanup() {
   defaults delete "$unsafe_migration_domain" >/dev/null 2>&1 || true
   defaults delete "$legacy_domain" >/dev/null 2>&1 || true
   defaults delete "io.github.securecrtconfigsync.probe.test.$$" >/dev/null 2>&1 || true
+  defaults delete "io.github.securecrtconfigsync.regen.test.$$" >/dev/null 2>&1 || true
+  defaults delete "io.github.securecrtconfigsync.pre.test.$$" >/dev/null 2>&1 || true
   if [ -n "$agent_pid" ]; then
     kill "$agent_pid" >/dev/null 2>&1 || true
   fi
@@ -547,5 +549,103 @@ if printf '%s\n' "$healthy_output" | grep -Fq 'Start SecureCRT from the launcher
   exit 1
 fi
 defaults delete "$probe_domain" >/dev/null 2>&1 || true
+# Regenerating a launcher that setup itself wrote must not be recorded as one
+# the user already had. LauncherAppBeforePresent is sticky and suppresses
+# removal entirely, so getting this wrong orphans the bundle on every later
+# disconnect, silently.
+regen_home="$test_root/regen-home"
+regen_domain="io.github.securecrtconfigsync.regen.test.$$"
+regen_launcher="$test_root/regen-Applications/SecureCRT (1Password).app"
+regen_state="$regen_home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist"
+regen_securecrt_b="$test_root/SecureCRT-Moved.app"
+mkdir -p "$regen_home" "$regen_securecrt_b/Contents/MacOS"
+printf '#!/bin/sh\nexit 0\n' >"$regen_securecrt_b/Contents/MacOS/SecureCRT"
+chmod 0755 "$regen_securecrt_b/Contents/MacOS/SecureCRT"
+
+run_regen_setup() {
+  HOME="$regen_home" \
+  SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+  SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  SECURECRT_SYNC_OPEN="$mock_open" \
+  SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
+  SECURECRT_SYNC_SECURECRT_APP="$1" \
+  SECURECRT_SYNC_LAUNCHER_APP="$regen_launcher" \
+    "$installer" \
+      --config "$config_path" \
+      --personal "$test_root/regen-personal" \
+      --preferences-domain "$regen_domain" >/dev/null
+}
+
+run_regen_setup "$fake_securecrt_app"
+assert_equal "false" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :LauncherAppBeforePresent' "$regen_state")" \
+  "first launcher install is not pre-existing"
+
+# Changing the SecureCRT path forces setup to rewrite the launcher.
+run_regen_setup "$regen_securecrt_b"
+grep -Fq "$regen_securecrt_b/Contents/MacOS/SecureCRT" "$regen_launcher/Contents/MacOS/launcher"
+assert_equal "false" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :LauncherAppBeforePresent' "$regen_state")" \
+  "setup's own regeneration is not pre-existing"
+assert_equal "$(shasum -a 256 "$regen_launcher/Contents/MacOS/launcher" | awk '{print $1}')" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :LauncherAppInstalledSha256' "$regen_state")" \
+  "recorded hash after regeneration"
+
+regen_disconnect="$(
+  HOME="$regen_home" \
+  SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+  SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+  SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+  SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+    bash "$disconnect"
+)"
+printf '%s\n' "$regen_disconnect" | grep -Fq 'remove the SecureCRT agent launcher'
+if [ -e "$regen_launcher" ]; then
+  echo "Disconnect orphaned a launcher that setup had regenerated." >&2
+  exit 1
+fi
+
+# A launcher the user put there first must survive disconnect untouched.
+preexisting_home="$test_root/pre-home"
+preexisting_domain="io.github.securecrtconfigsync.pre.test.$$"
+preexisting_launcher="$test_root/pre-Applications/SecureCRT (1Password).app"
+mkdir -p "$preexisting_home" "$preexisting_launcher/Contents/MacOS"
+printf '#!/bin/sh\n# hand written\nexit 0\n' \
+  >"$preexisting_launcher/Contents/MacOS/launcher"
+chmod 0755 "$preexisting_launcher/Contents/MacOS/launcher"
+HOME="$preexisting_home" \
+SECURECRT_SYNC_ONEPASSWORD_APP="$onepassword_app" \
+SECURECRT_SYNC_ONEPASSWORD_SOCKET="$agent_socket" \
+SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+SECURECRT_SYNC_OPEN="$mock_open" \
+SECURECRT_SYNC_LAUNCHD_OVERRIDES="$launchd_overrides" \
+SECURECRT_SYNC_SECURECRT_APP="$fake_securecrt_app" \
+SECURECRT_SYNC_LAUNCHER_APP="$preexisting_launcher" \
+  "$installer" \
+    --config "$config_path" \
+    --personal "$test_root/pre-personal" \
+    --preferences-domain "$preexisting_domain" >/dev/null
+assert_equal "true" \
+  "$(/usr/libexec/PlistBuddy -c 'Print :LauncherAppBeforePresent' \
+    "$preexisting_home/Library/Application Support/VanDyke/SecureCRT/Setup State/onedrive-sync.plist")" \
+  "a launcher the user already had is recorded as pre-existing"
+HOME="$preexisting_home" \
+SECURECRT_SYNC_LAUNCHCTL="$mock_launchctl" \
+SECURECRT_SYNC_LAUNCHCTL_STATE="$launchctl_state" \
+SECURECRT_SYNC_LAUNCHCTL_DISABLED="$launchctl_disabled" \
+SECURECRT_SYNC_LAUNCHCTL_ENABLED="$launchctl_enabled" \
+  bash "$disconnect" >/dev/null
+[ -e "$preexisting_launcher" ] || \
+  { echo "Disconnect removed a launcher it did not create." >&2; exit 1; }
+defaults delete "$regen_domain" >/dev/null 2>&1 || true
+defaults delete "$preexisting_domain" >/dev/null 2>&1 || true
+
 
 echo "macOS SecureCRT setup integration test passed."

@@ -23,7 +23,6 @@ onepassword_socket="${SECURECRT_SYNC_ONEPASSWORD_SOCKET:-$HOME/Library/Group Con
 system_ssh_agent_label="${SECURECRT_SYNC_SYSTEM_SSH_AGENT:-com.openssh.ssh-agent}"
 launchctl_bin="${SECURECRT_SYNC_LAUNCHCTL:-launchctl}"
 open_bin="${SECURECRT_SYNC_OPEN:-/usr/bin/open}"
-launchd_overrides_plist="${SECURECRT_SYNC_LAUNCHD_OVERRIDES:-/var/db/com.apple.xpc.launchd/disabled.$(id -u).plist}"
 launch_agent_label="com.securecrt-config-sync.ssh-agent"
 launch_domain="gui/$(id -u)"
 securecrt_app="${SECURECRT_SYNC_SECURECRT_APP:-/Applications/SecureCRT.app}"
@@ -38,7 +37,6 @@ launcher_ok=false
 gui_socket=""
 securecrt_socket=""
 securecrt_running=false
-launch_agent_loaded=false
 
 echo
 echo "1Password SSH agent"
@@ -84,6 +82,10 @@ elif ! grep -Fq "$onepassword_socket" "$launcher_exec"; then
 elif ! grep -Fq "$securecrt_app/Contents/MacOS/SecureCRT" "$launcher_exec"; then
   fail "launcher does not exec $securecrt_app/Contents/MacOS/SecureCRT"
   info "Re-run setup-onedrive-macos.sh to regenerate it."
+elif [ ! -x "$securecrt_app/Contents/MacOS/SecureCRT" ]; then
+  fail "launcher points at $securecrt_app/Contents/MacOS/SecureCRT, which is missing"
+  info "Install SecureCRT there, or re-run setup with"
+  info "SECURECRT_SYNC_SECURECRT_APP set to its real location."
 else
   launcher_ok=true
   pass "$launcher_app"
@@ -92,7 +94,6 @@ fi
 echo
 echo "Sync LaunchAgent ($launch_agent_label)"
 if "$launchctl_bin" print "$launch_domain/$launch_agent_label" >/dev/null 2>&1; then
-  launch_agent_loaded=true
   pass "loaded"
 else
   fail "not loaded - run setup-onedrive-macos.sh"
